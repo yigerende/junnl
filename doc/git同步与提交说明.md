@@ -41,21 +41,13 @@
 
 ---
 
-## 三、本地：一条命令提交并推送
+## 三、本地：提交并推送
 
 在项目根目录执行：
 
 ```powershell
-# 带提交说明
-.\push.ps1 "feat: 更新缓存逻辑"
-
-# 不带说明（自动用时间戳作为提交信息）
-.\push.ps1
+.\push.ps1 "提交说明"
 ```
-
-脚本会自动执行：`git add .` → `git commit` → `git push`，并跳过「无改动」的情况。
-
-> Linux / Mac 环境可用 `./push.sh "提交说明"`（需先 `chmod +x push.sh`）。
 
 ---
 

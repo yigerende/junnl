@@ -49,7 +49,11 @@ pub(crate) fn rewrite_cache_usage(
 /// 计算改写后的 input_tokens。
 ///
 /// 仅当模拟缓存开启、当前路径开启、且 `input_random_max > 0` 时，
-/// 返回 `Some(随机 [0, input_random_max])`；否则返回 `None`（表示不改写，沿用原值）。
+/// 返回 `Some(随机 [1, input_random_max])`；否则返回 `None`（表示不改写，沿用原值）。
+///
+/// 下限取 1 而非 0：下游 new-api 解析 Claude 流式 usage 时，message_delta 的
+/// input_tokens 只有在 `> 0` 才会覆盖 message_start 里的真实值。若这里返回 0，
+/// new-api 会丢弃该 0 并回退使用 message_start 的真实大值，导致偶发的超大 input 计费。
 pub(crate) fn rewrite_input_tokens(
     config: &CacheOptimizerConfig,
     path: ResponsePath,
@@ -65,7 +69,7 @@ pub(crate) fn rewrite_input_tokens(
     if !path_enabled || config.input_random_max == 0 {
         return None;
     }
-    Some(random_in_range(0, config.input_random_max as u64))
+    Some(random_in_range(1, config.input_random_max as u64))
 }
 
 fn weighted_rewrite(raw_read: i32, raw_write: i32, config: &CacheOptimizerConfig) -> (i32, i32) {
@@ -266,5 +270,25 @@ mod tests {
             assert!(r >= 5000 && r <= 10000);
             assert_eq!(w, 0); // readOnly shape => write is 0
         }
+    }
+
+    #[test]
+    fn rewrite_input_tokens_never_returns_zero() {
+        // 下游 new-api 在 message_delta 的 input_tokens 为 0 时会丢弃并回退到
+        // message_start 的真实大值，因此改写后的 input 必须 >= 1。
+        let mut config = make_config("weighted", true);
+        config.input_random_max = 10;
+        for _ in 0..500 {
+            let v = rewrite_input_tokens(&config, ResponsePath::Stream)
+                .expect("input_random_max > 0 should rewrite");
+            assert!(v >= 1 && v <= 10, "input {v} out of [1,10]");
+        }
+    }
+
+    #[test]
+    fn rewrite_input_tokens_disabled_when_max_zero() {
+        let mut config = make_config("weighted", true);
+        config.input_random_max = 0;
+        assert_eq!(rewrite_input_tokens(&config, ResponsePath::Stream), None);
     }
 }
