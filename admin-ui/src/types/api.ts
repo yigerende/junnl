@@ -117,6 +117,7 @@ export interface CacheOptimizerConfig {
   writeSegments: [CacheSegment, CacheSegment, CacheSegment]
   rewriteOnlyWhenPresent: boolean
   keepRawBreakdown: boolean
+  inputRandomMax: number
 }
 
 // 单条模型映射

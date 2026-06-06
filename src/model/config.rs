@@ -81,6 +81,11 @@ pub struct CacheOptimizerConfig {
 
     #[serde(default = "default_true")]
     pub keep_raw_breakdown: bool,
+
+    /// input_tokens 随机上限：>0 时把返回给下游的 input_tokens 替换为随机 [0, N]，
+    /// =0 表示不替换（保持原有计算逻辑）。仅在模拟缓存开启时生效。
+    #[serde(default)]
+    pub input_random_max: u32,
 }
 
 fn default_cache_optimizer_mode() -> String {
@@ -140,6 +145,7 @@ impl Default for CacheOptimizerConfig {
             write_segments: default_write_segments(),
             rewrite_only_when_present: true,
             keep_raw_breakdown: true,
+            input_random_max: 0,
         }
     }
 }

@@ -1086,6 +1086,14 @@ async fn handle_non_stream_request(
             inject_cache_usage_fields(&mut usage, cache_context);
         }
 
+        // 如果模拟缓存开启且配置了 input 随机上限，替换 input_tokens
+        if let Some(new_input) = super::cache_rewriter::rewrite_input_tokens(
+            &cache_optimizer.read(),
+            super::cache_rewriter::ResponsePath::NonStream,
+        ) {
+            usage["input_tokens"] = json!(new_input);
+        }
+
         json!({
             "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             "type": "message",

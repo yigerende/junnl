@@ -46,6 +46,28 @@ pub(crate) fn rewrite_cache_usage(
     }
 }
 
+/// 计算改写后的 input_tokens。
+///
+/// 仅当模拟缓存开启、当前路径开启、且 `input_random_max > 0` 时，
+/// 返回 `Some(随机 [0, input_random_max])`；否则返回 `None`（表示不改写，沿用原值）。
+pub(crate) fn rewrite_input_tokens(
+    config: &CacheOptimizerConfig,
+    path: ResponsePath,
+) -> Option<i32> {
+    if !config.enabled {
+        return None;
+    }
+    let path_enabled = match path {
+        ResponsePath::Stream => config.enabled_stream,
+        ResponsePath::NonStream => config.enabled_non_stream,
+        ResponsePath::Buffered => config.enabled_buffered,
+    };
+    if !path_enabled || config.input_random_max == 0 {
+        return None;
+    }
+    Some(random_in_range(0, config.input_random_max as u64))
+}
+
 fn weighted_rewrite(raw_read: i32, raw_write: i32, config: &CacheOptimizerConfig) -> (i32, i32) {
     let total_weight = config.weight_read_only
         + config.weight_write_only

@@ -33,6 +33,7 @@ const DEFAULT_CONFIG: CacheOptimizerConfig = {
   ],
   rewriteOnlyWhenPresent: true,
   keepRawBreakdown: true,
+  inputRandomMax: 0,
 }
 
 function simulatePreview(config: CacheOptimizerConfig): { cacheRead: number; cacheWrite: number } {
@@ -284,6 +285,19 @@ export function CacheOptimizer() {
                 onChange={e => updateField('writeMax', Number(e.target.value))}
                 className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm" />
             </label>
+          </div>
+
+          {/* input_tokens 随机上限 */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <label className="space-y-1.5">
+              <span className="text-sm font-medium">输入 token 随机上限</span>
+              <input type="number" min={0} value={form.inputRandomMax}
+                onChange={e => updateField('inputRandomMax', Number(e.target.value))}
+                className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm" />
+            </label>
+            <div className="flex items-end text-xs text-muted-foreground pb-1.5">
+              填 0 表示不替换（按真实逻辑返回）；填 N（如 20）则返回给下游的 input_tokens 替换为随机 0~N。仅在模拟缓存开启时生效。
+            </div>
           </div>
 
           {/* 权重 */}

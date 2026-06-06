@@ -1244,6 +1244,14 @@ impl StreamContext {
             .map(|cache_usage| billed_input_tokens(final_input_tokens, cache_usage))
             .unwrap_or(final_input_tokens);
 
+        // 如果模拟缓存开启且配置了 input 随机上限，替换 reported_input_tokens
+        let reported_input_tokens = if let Some(optimizer) = &self.cache_optimizer {
+            super::cache_rewriter::rewrite_input_tokens(&optimizer.read(), self.response_path)
+                .unwrap_or(reported_input_tokens)
+        } else {
+            reported_input_tokens
+        };
+
         // 生成最终事件
         let final_output_tokens = self.upstream_output_tokens.unwrap_or(self.output_tokens);
 
