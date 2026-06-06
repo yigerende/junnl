@@ -9,7 +9,9 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::model::config::{CacheOptimizerConfig, Config, ModelMappingConfig};
 
 use super::error::AdminServiceError;
 use super::types::{
@@ -38,6 +40,14 @@ pub struct AdminService {
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    /// 运行时模拟缓存配置（与 Anthropic AppState 共享同一个 Arc）
+    cache_optimizer_live: Option<Arc<parking_lot::RwLock<CacheOptimizerConfig>>>,
+    /// 运行时模型映射配置（与 Anthropic AppState 共享同一个 Arc）
+    model_mapping_live: Option<Arc<parking_lot::RwLock<ModelMappingConfig>>>,
+    /// Kiro Provider（用于拉取可用模型列表）
+    provider: Option<Arc<KiroProvider>>,
+    /// 调用日志（与 Anthropic AppState 共享同一个环形缓冲）
+    call_log: Option<crate::anthropic::CallLog>,
 }
 
 impl AdminService {
@@ -56,7 +66,31 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
+            cache_optimizer_live: None,
+            model_mapping_live: None,
+            provider: None,
+            call_log: None,
         }
+    }
+
+    pub fn with_cache_optimizer(mut self, optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>) -> Self {
+        self.cache_optimizer_live = Some(optimizer);
+        self
+    }
+
+    pub fn with_model_mapping(mut self, mapping: Arc<parking_lot::RwLock<ModelMappingConfig>>) -> Self {
+        self.model_mapping_live = Some(mapping);
+        self
+    }
+
+    pub fn with_provider(mut self, provider: Arc<KiroProvider>) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    pub fn with_call_log(mut self, call_log: crate::anthropic::CallLog) -> Self {
+        self.call_log = Some(call_log);
+        self
     }
 
     /// 获取所有凭据状态
@@ -299,6 +333,163 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    /// 获取模拟缓存配置
+    pub fn get_cache_optimizer(&self) -> CacheOptimizerConfig {
+        if let Some(live) = &self.cache_optimizer_live {
+            live.read().clone()
+        } else {
+            self.token_manager.config().cache_optimizer.clone()
+        }
+    }
+
+    /// 更新模拟缓存配置
+    pub fn set_cache_optimizer(
+        &self,
+        new_config: CacheOptimizerConfig,
+    ) -> Result<CacheOptimizerConfig, AdminServiceError> {
+        let valid_modes = ["passthrough", "zero", "cap", "random", "weighted"];
+        if !valid_modes.contains(&new_config.mode.as_str()) {
+            return Err(AdminServiceError::InvalidCredential(
+                "mode 必须是 passthrough / zero / cap / random / weighted 之一".to_string(),
+            ));
+        }
+
+        let config_path = self
+            .token_manager
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| {
+                AdminServiceError::InternalError("配置文件路径未知".to_string())
+            })?;
+
+        let mut config = Config::load(&config_path)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        config.cache_optimizer = new_config.clone();
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        // 热更新运行时配置
+        if let Some(live) = &self.cache_optimizer_live {
+            *live.write() = new_config.clone();
+        }
+
+        Ok(new_config)
+    }
+
+    /// 获取模型映射配置
+    pub fn get_model_mapping(&self) -> ModelMappingConfig {
+        if let Some(live) = &self.model_mapping_live {
+            live.read().clone()
+        } else {
+            self.token_manager.config().model_mapping.clone()
+        }
+    }
+
+    /// 更新模型映射配置
+    pub fn set_model_mapping(
+        &self,
+        mut new_config: ModelMappingConfig,
+    ) -> Result<ModelMappingConfig, AdminServiceError> {
+        // 规范化：去除空行（alias/target 任一为空），按 alias 去重（后写覆盖），上限 200 条
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut cleaned: Vec<_> = Vec::new();
+        for m in new_config.mappings.into_iter().rev() {
+            let alias = m.alias.trim().to_string();
+            let target = m.target.trim().to_string();
+            if alias.is_empty() || target.is_empty() {
+                continue;
+            }
+            let key = alias.to_lowercase();
+            if seen.contains(&key) {
+                continue; // 已有更靠后的同名条目（rev 遍历，后写优先）
+            }
+            seen.insert(key);
+            cleaned.push(crate::model::config::ModelMapping {
+                alias,
+                target,
+                enabled: m.enabled,
+            });
+        }
+        cleaned.reverse();
+        if cleaned.len() > 200 {
+            cleaned.truncate(200);
+        }
+        new_config.mappings = cleaned;
+
+        let config_path = self
+            .token_manager
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| {
+                AdminServiceError::InternalError("配置文件路径未知".to_string())
+            })?;
+
+        let mut config = Config::load(&config_path)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        config.model_mapping = new_config.clone();
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        // 热更新运行时配置
+        if let Some(live) = &self.model_mapping_live {
+            *live.write() = new_config.clone();
+        }
+
+        Ok(new_config)
+    }
+
+    /// 拉取上游可用模型 ID 列表（供前端选择映射目标）
+    pub async fn list_available_models(&self) -> Result<Vec<String>, AdminServiceError> {
+        let provider = self.provider.as_ref().ok_or_else(|| {
+            AdminServiceError::InternalError("Provider 未配置".to_string())
+        })?;
+        let models = provider
+            .list_available_models()
+            .await
+            .map_err(|e| AdminServiceError::UpstreamError(e.to_string()))?;
+        let ids: Vec<String> = models
+            .into_iter()
+            .map(|m| m.model_id)
+            .filter(|id| !id.trim().is_empty())
+            .collect();
+        Ok(ids)
+    }
+
+    /// 获取调用日志（最新在前），最多 limit 条
+    pub fn get_call_logs(&self, limit: usize) -> Vec<crate::anthropic::call_log::CallLogEntry> {
+        match &self.call_log {
+            Some(log) => log.recent(limit),
+            None => Vec::new(),
+        }
+    }
+
+    /// 清空调用日志
+    pub fn clear_call_logs(&self) {
+        if let Some(log) = &self.call_log {
+            log.clear();
+        }
+    }
+
+    /// 获取调用日志容量上限
+    pub fn get_call_log_capacity(&self) -> usize {
+        match &self.call_log {
+            Some(log) => log.capacity(),
+            None => 0,
+        }
+    }
+
+    /// 设置调用日志容量上限，返回实际生效值
+    pub fn set_call_log_capacity(&self, capacity: usize) -> usize {
+        match &self.call_log {
+            Some(log) => log.set_capacity(capacity),
+            None => 0,
+        }
     }
 
     /// 强制刷新指定凭据的 Token

@@ -7,9 +7,13 @@ use axum::{
     routing::{get, post},
 };
 
+use std::sync::Arc;
+
 use crate::kiro::provider::KiroProvider;
+use crate::model::config::{CacheOptimizerConfig, ModelMappingConfig};
 
 use super::{
+    call_log::CallLog,
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer},
 };
@@ -36,19 +40,25 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// 创建带有 KiroProvider 的 Anthropic API 路由
 pub fn create_router_with_provider(
     api_key: impl Into<String>,
-    kiro_provider: Option<KiroProvider>,
+    kiro_provider: Option<Arc<KiroProvider>>,
     extract_thinking: bool,
     prompt_cache_ttl_seconds: u64,
     prompt_cache_accounting_enabled: bool,
+    cache_optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>,
+    model_mapping: Arc<parking_lot::RwLock<ModelMappingConfig>>,
+    call_log: CallLog,
 ) -> Router {
     let mut state = AppState::new(
         api_key,
         extract_thinking,
         prompt_cache_ttl_seconds,
         prompt_cache_accounting_enabled,
+        cache_optimizer,
+        model_mapping,
+        call_log,
     );
     if let Some(provider) = kiro_provider {
-        state = state.with_kiro_provider(provider);
+        state = state.with_kiro_provider_arc(provider);
     }
 
     // 需要认证的 /v1 路由

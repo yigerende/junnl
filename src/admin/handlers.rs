@@ -2,7 +2,7 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
 };
 
@@ -13,6 +13,7 @@ use super::{
         SuccessResponse,
     },
 };
+use crate::model::config::{CacheOptimizerConfig, ModelMappingConfig};
 
 /// GET /api/admin/credentials
 /// 获取所有凭据状态
@@ -139,4 +140,94 @@ pub async fn set_load_balancing_mode(
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// GET /api/admin/cache-optimizer
+/// 获取模拟缓存配置
+pub async fn get_cache_optimizer(State(state): State<AdminState>) -> impl IntoResponse {
+    let config = state.service.get_cache_optimizer();
+    Json(serde_json::json!({ "config": config }))
+}
+
+/// PUT /api/admin/cache-optimizer
+/// 更新模拟缓存配置
+pub async fn set_cache_optimizer(
+    State(state): State<AdminState>,
+    Json(payload): Json<CacheOptimizerConfig>,
+) -> impl IntoResponse {
+    match state.service.set_cache_optimizer(payload) {
+        Ok(config) => Json(serde_json::json!({ "config": config })).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/model-mapping
+/// 获取模型映射配置
+pub async fn get_model_mapping(State(state): State<AdminState>) -> impl IntoResponse {
+    let config = state.service.get_model_mapping();
+    Json(serde_json::json!({ "config": config }))
+}
+
+/// PUT /api/admin/model-mapping
+/// 更新模型映射配置
+pub async fn set_model_mapping(
+    State(state): State<AdminState>,
+    Json(payload): Json<ModelMappingConfig>,
+) -> impl IntoResponse {
+    match state.service.set_model_mapping(payload) {
+        Ok(config) => Json(serde_json::json!({ "config": config })).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/available-models
+/// 拉取上游可用模型 ID 列表（供前端选择映射目标）
+pub async fn get_available_models(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.list_available_models().await {
+        Ok(models) => Json(serde_json::json!({ "models": models })).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// 调用日志查询参数
+#[derive(serde::Deserialize)]
+pub struct CallLogQuery {
+    /// 返回条数上限（默认 1000）
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// GET /api/admin/call-logs?limit=N
+/// 获取调用日志（最新在前）
+pub async fn get_call_logs(
+    State(state): State<AdminState>,
+    Query(q): Query<CallLogQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(1000).clamp(1, 100_000);
+    let logs = state.service.get_call_logs(limit);
+    let capacity = state.service.get_call_log_capacity();
+    Json(serde_json::json!({ "logs": logs, "capacity": capacity }))
+}
+
+/// DELETE /api/admin/call-logs
+/// 清空调用日志
+pub async fn clear_call_logs(State(state): State<AdminState>) -> impl IntoResponse {
+    state.service.clear_call_logs();
+    Json(SuccessResponse::new("调用日志已清空".to_string()))
+}
+
+/// 设置容量请求体
+#[derive(serde::Deserialize)]
+pub struct SetCallLogCapacityRequest {
+    pub capacity: usize,
+}
+
+/// PUT /api/admin/call-logs/capacity
+/// 设置调用日志保留条数
+pub async fn set_call_log_capacity(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetCallLogCapacityRequest>,
+) -> impl IntoResponse {
+    let applied = state.service.set_call_log_capacity(payload.capacity);
+    Json(serde_json::json!({ "capacity": applied }))
 }

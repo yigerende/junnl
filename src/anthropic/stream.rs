@@ -3,11 +3,13 @@
 //! 实现 Kiro → Anthropic 流式响应转换和 SSE 状态管理
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
+use crate::model::config::CacheOptimizerConfig;
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -565,6 +567,10 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 模拟缓存优化器配置（可选，用于改写最终缓存字段）
+    pub cache_optimizer: Option<Arc<parking_lot::RwLock<CacheOptimizerConfig>>>,
+    /// 当前响应路径类型
+    pub response_path: super::cache_rewriter::ResponsePath,
 }
 
 impl StreamContext {
@@ -605,6 +611,8 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            cache_optimizer: None,
+            response_path: super::cache_rewriter::ResponsePath::Stream,
         }
     }
 
@@ -1217,6 +1225,21 @@ impl StreamContext {
         let cache_usage = self.cache_usage.map(|cache_usage| {
             scale_cache_usage(cache_usage, self.input_tokens, final_input_tokens)
         });
+        // 如果模拟缓存开启，改写 cache 字段
+        let cache_usage = cache_usage.map(|mut cu| {
+            if let Some(optimizer) = &self.cache_optimizer {
+                let config = optimizer.read();
+                let (new_read, new_write) = super::cache_rewriter::rewrite_cache_usage(
+                    cu.cache_read_input_tokens,
+                    cu.cache_creation_input_tokens,
+                    &config,
+                    self.response_path,
+                );
+                cu.cache_read_input_tokens = new_read;
+                cu.cache_creation_input_tokens = new_write;
+            }
+            cu
+        });
         let reported_input_tokens = cache_usage
             .map(|cache_usage| billed_input_tokens(final_input_tokens, cache_usage))
             .unwrap_or(final_input_tokens);
@@ -1378,6 +1401,11 @@ impl BufferedStreamContext {
             event_buffer: Vec::new(),
             initial_events_generated: false,
         }
+    }
+
+    pub fn set_cache_optimizer(&mut self, optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>) {
+        self.inner.cache_optimizer = Some(optimizer);
+        self.inner.response_path = super::cache_rewriter::ResponsePath::Buffered;
     }
 
     /// 处理 Kiro 事件并缓冲结果

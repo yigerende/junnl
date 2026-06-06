@@ -8,6 +8,9 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  CacheOptimizerConfig,
+  ModelMappingConfig,
+  CallLogEntry,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -103,4 +106,52 @@ export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'bala
 export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
   const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
   return data
+}
+
+// 获取模拟缓存配置
+export async function getCacheOptimizer(): Promise<CacheOptimizerConfig> {
+  const { data } = await api.get<{ config: CacheOptimizerConfig }>('/cache-optimizer')
+  return data.config
+}
+
+// 更新模拟缓存配置
+export async function setCacheOptimizer(config: CacheOptimizerConfig): Promise<CacheOptimizerConfig> {
+  const { data } = await api.put<{ config: CacheOptimizerConfig }>('/cache-optimizer', config)
+  return data.config
+}
+
+// 获取模型映射配置
+export async function getModelMapping(): Promise<ModelMappingConfig> {
+  const { data } = await api.get<{ config: ModelMappingConfig }>('/model-mapping')
+  return data.config
+}
+
+// 更新模型映射配置
+export async function setModelMapping(config: ModelMappingConfig): Promise<ModelMappingConfig> {
+  const { data } = await api.put<{ config: ModelMappingConfig }>('/model-mapping', config)
+  return data.config
+}
+
+// 拉取上游可用模型 ID 列表
+export async function getAvailableModels(): Promise<string[]> {
+  const { data } = await api.get<{ models: string[] }>('/available-models')
+  return data.models
+}
+
+// 获取调用日志
+export async function getCallLogs(limit = 1000): Promise<{ logs: CallLogEntry[]; capacity: number }> {
+  const { data } = await api.get<{ logs: CallLogEntry[]; capacity: number }>('/call-logs', { params: { limit } })
+  return data
+}
+
+// 清空调用日志
+export async function clearCallLogs(): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>('/call-logs')
+  return data
+}
+
+// 设置调用日志保留条数
+export async function setCallLogCapacity(capacity: number): Promise<number> {
+  const { data } = await api.put<{ capacity: number }>('/call-logs/capacity', { capacity })
+  return data.capacity
 }

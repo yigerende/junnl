@@ -2,14 +2,16 @@
 
 use axum::{
     Router, middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 
 use super::{
     handlers::{
-        add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_credential_balance, get_load_balancing_mode, reset_failure_count,
-        set_credential_disabled, set_credential_priority, set_load_balancing_mode,
+        add_credential, clear_call_logs, delete_credential, force_refresh_token,
+        get_all_credentials, get_available_models, get_cache_optimizer, get_call_logs,
+        get_credential_balance, get_load_balancing_mode, get_model_mapping, reset_failure_count,
+        set_cache_optimizer, set_call_log_capacity, set_credential_disabled,
+        set_credential_priority, set_load_balancing_mode, set_model_mapping,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -48,6 +50,20 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
         )
+        .route(
+            "/cache-optimizer",
+            get(get_cache_optimizer).put(set_cache_optimizer),
+        )
+        .route(
+            "/model-mapping",
+            get(get_model_mapping).put(set_model_mapping),
+        )
+        .route("/available-models", get(get_available_models))
+        .route(
+            "/call-logs",
+            get(get_call_logs).delete(clear_call_logs),
+        )
+        .route("/call-logs/capacity", put(set_call_log_capacity))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

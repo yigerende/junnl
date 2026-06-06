@@ -30,6 +30,33 @@ use super::types::{
 };
 use super::websearch;
 
+/// 应用模型映射并记录调用日志。
+///
+/// 把下游请求的模型名替换为上游实际模型名（内部逻辑不变），
+/// 同时向调用日志写入一条记录（下游模型、上游模型、是否流式、端点、是否命中映射）。
+fn apply_model_mapping_and_log(
+    state: &AppState,
+    payload: &mut MessagesRequest,
+    endpoint: &str,
+    stream: bool,
+) {
+    let downstream = payload.model.clone();
+    let upstream = state.model_mapping.read().resolve_alias(&downstream);
+    let mapped = upstream != downstream;
+    if mapped {
+        tracing::info!(from = %downstream, to = %upstream, "模型映射生效");
+        payload.model = upstream.clone();
+    }
+    state.call_log.record(super::call_log::CallLogEntry {
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        downstream_model: downstream,
+        upstream_model: upstream,
+        stream,
+        endpoint: endpoint.to_string(),
+        mapped,
+    });
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct CacheUsageContext {
     cache_creation_input_tokens: i32,
@@ -425,7 +452,7 @@ fn model_from_kiro(model: crate::kiro::provider::KiroAvailableModel) -> Option<M
 pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    let models = if let Some(provider) = &state.kiro_provider {
+    let mut models = if let Some(provider) = &state.kiro_provider {
         match provider.list_available_models().await {
             Ok(dynamic_models) => {
                 let models: Vec<Model> = dynamic_models
@@ -447,6 +474,16 @@ pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         static_models()
     };
+
+    // 模型映射：把已映射的 target 用 alias 展示给下游
+    {
+        let mapping = state.model_mapping.read();
+        for model in &mut models {
+            if let Some(alias) = mapping.alias_for_target(&model.id) {
+                model.id = alias;
+            }
+        }
+    }
 
     Json(ModelsResponse {
         object: "list".to_string(),
@@ -486,6 +523,10 @@ pub async fn post_messages(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+
+    // 应用模型映射 + 记录调用日志（内部逻辑不变）
+    let is_stream = payload.stream;
+    apply_model_mapping_and_log(&state, &mut payload, "/v1", is_stream);
 
     let prompt_cache = state.prompt_cache_snapshot();
 
@@ -586,6 +627,7 @@ pub async fn post_messages(
                 .then_some(&prompt_cache.tracker),
             thinking_enabled,
             tool_name_map,
+            state.cache_optimizer.clone(),
         )
         .await
     } else {
@@ -602,6 +644,7 @@ pub async fn post_messages(
                 .then_some(&prompt_cache.tracker),
             extract_thinking,
             tool_name_map,
+            state.cache_optimizer.clone(),
         )
         .await
     }
@@ -617,6 +660,7 @@ async fn handle_stream_request(
     cache_tracker: Option<&std::sync::Arc<crate::anthropic::cache_tracker::CacheTracker>>,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    cache_optimizer: std::sync::Arc<parking_lot::RwLock<crate::model::config::CacheOptimizerConfig>>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let api_result = match provider.call_api_stream(request_body).await {
@@ -655,6 +699,7 @@ async fn handle_stream_request(
         thinking_enabled,
         tool_name_map,
     );
+    ctx.cache_optimizer = Some(cache_optimizer);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -784,6 +829,7 @@ async fn handle_non_stream_request(
     cache_tracker: Option<&std::sync::Arc<crate::anthropic::cache_tracker::CacheTracker>>,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    cache_optimizer: std::sync::Arc<parking_lot::RwLock<crate::model::config::CacheOptimizerConfig>>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let api_result = match provider.call_api(request_body).await {
@@ -1026,7 +1072,17 @@ async fn handle_non_stream_request(
             "input_tokens": billed_input_tokens,
             "output_tokens": output_tokens
         });
-        if let Some(cache_context) = final_cache_context {
+        if let Some(mut cache_context) = final_cache_context {
+            // 如果模拟缓存开启，改写 cache 字段
+            let optimizer_config = cache_optimizer.read();
+            let (new_read, new_write) = super::cache_rewriter::rewrite_cache_usage(
+                cache_context.cache_read_input_tokens,
+                cache_context.cache_creation_input_tokens,
+                &optimizer_config,
+                super::cache_rewriter::ResponsePath::NonStream,
+            );
+            cache_context.cache_read_input_tokens = new_read;
+            cache_context.cache_creation_input_tokens = new_write;
             inject_cache_usage_fields(&mut usage, cache_context);
         }
 
@@ -1146,6 +1202,10 @@ pub async fn post_messages_cc(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
+    // 应用模型映射 + 记录调用日志（内部逻辑不变）
+    let is_stream = payload.stream;
+    apply_model_mapping_and_log(&state, &mut payload, "/cc/v1", is_stream);
+
     let prompt_cache = state.prompt_cache_snapshot();
 
     // 估算输入 tokens，cache 记账需要在 payload 被移动前完成。
@@ -1245,6 +1305,7 @@ pub async fn post_messages_cc(
                 .then_some(&prompt_cache.tracker),
             thinking_enabled,
             tool_name_map,
+            state.cache_optimizer.clone(),
         )
         .await
     } else {
@@ -1261,6 +1322,7 @@ pub async fn post_messages_cc(
                 .then_some(&prompt_cache.tracker),
             extract_thinking,
             tool_name_map,
+            state.cache_optimizer.clone(),
         )
         .await
     }
@@ -1279,6 +1341,7 @@ async fn handle_stream_request_buffered(
     cache_tracker: Option<&std::sync::Arc<crate::anthropic::cache_tracker::CacheTracker>>,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    cache_optimizer: std::sync::Arc<parking_lot::RwLock<crate::model::config::CacheOptimizerConfig>>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let api_result = match provider.call_api_stream(request_body).await {
@@ -1310,13 +1373,14 @@ async fn handle_stream_request_buffered(
     });
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(
+    let mut ctx = BufferedStreamContext::new(
         model,
         estimated_input_tokens,
         final_cache_usage,
         thinking_enabled,
         tool_name_map,
     );
+    ctx.set_cache_optimizer(cache_optimizer);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(api_result.response, ctx);

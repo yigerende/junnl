@@ -17,6 +17,200 @@ impl Default for TlsBackend {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheSegment {
+    pub min: u64,
+    pub max: u64,
+    pub weight: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheOptimizerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "default_true")]
+    pub enabled_stream: bool,
+
+    #[serde(default = "default_true")]
+    pub enabled_non_stream: bool,
+
+    #[serde(default = "default_true")]
+    pub enabled_buffered: bool,
+
+    #[serde(default = "default_cache_optimizer_mode")]
+    pub mode: String,
+
+    #[serde(default = "default_read_min")]
+    pub read_min: u64,
+
+    #[serde(default = "default_read_max")]
+    pub read_max: u64,
+
+    #[serde(default)]
+    pub write_min: u64,
+
+    #[serde(default = "default_write_max")]
+    pub write_max: u64,
+
+    #[serde(default = "default_weight_read_only")]
+    pub weight_read_only: u32,
+
+    #[serde(default = "default_weight_write_only")]
+    pub weight_write_only: u32,
+
+    #[serde(default = "default_weight_read_write")]
+    pub weight_read_write: u32,
+
+    #[serde(default)]
+    pub weight_none: u32,
+
+    #[serde(default)]
+    pub use_segment_weights: bool,
+
+    #[serde(default = "default_read_segments")]
+    pub read_segments: Vec<CacheSegment>,
+
+    #[serde(default = "default_write_segments")]
+    pub write_segments: Vec<CacheSegment>,
+
+    #[serde(default = "default_true")]
+    pub rewrite_only_when_present: bool,
+
+    #[serde(default = "default_true")]
+    pub keep_raw_breakdown: bool,
+}
+
+fn default_cache_optimizer_mode() -> String {
+    "weighted".to_string()
+}
+fn default_read_min() -> u64 {
+    300
+}
+fn default_read_max() -> u64 {
+    1200
+}
+fn default_write_max() -> u64 {
+    500
+}
+fn default_weight_read_only() -> u32 {
+    55
+}
+fn default_weight_write_only() -> u32 {
+    15
+}
+fn default_weight_read_write() -> u32 {
+    30
+}
+fn default_read_segments() -> Vec<CacheSegment> {
+    vec![
+        CacheSegment { min: 90000, max: 110000, weight: 35 },
+        CacheSegment { min: 110001, max: 130000, weight: 45 },
+        CacheSegment { min: 130001, max: 145000, weight: 20 },
+    ]
+}
+fn default_write_segments() -> Vec<CacheSegment> {
+    vec![
+        CacheSegment { min: 20, max: 200, weight: 55 },
+        CacheSegment { min: 201, max: 800, weight: 35 },
+        CacheSegment { min: 801, max: 3000, weight: 10 },
+    ]
+}
+
+impl Default for CacheOptimizerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            enabled_stream: true,
+            enabled_non_stream: true,
+            enabled_buffered: true,
+            mode: default_cache_optimizer_mode(),
+            read_min: default_read_min(),
+            read_max: default_read_max(),
+            write_min: 0,
+            write_max: default_write_max(),
+            weight_read_only: default_weight_read_only(),
+            weight_write_only: default_weight_write_only(),
+            weight_read_write: default_weight_read_write(),
+            weight_none: 0,
+            use_segment_weights: false,
+            read_segments: default_read_segments(),
+            write_segments: default_write_segments(),
+            rewrite_only_when_present: true,
+            keep_raw_breakdown: true,
+        }
+    }
+}
+
+/// 单条模型映射
+///
+/// - `alias`：请求的模型（下游发来的模型名）
+/// - `target`：实际模型（转发给上游 Kiro 的模型名）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelMapping {
+    pub alias: String,
+    pub target: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// 模型映射配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelMappingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// 模型列表是否用 alias 替换已映射的 target 显示
+    #[serde(default = "default_true")]
+    pub hide_mapped_targets: bool,
+
+    #[serde(default)]
+    pub mappings: Vec<ModelMapping>,
+}
+
+impl Default for ModelMappingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hide_mapped_targets: true,
+            mappings: Vec::new(),
+        }
+    }
+}
+
+impl ModelMappingConfig {
+    /// 解析下游请求的模型名 → 上游实际模型名。
+    /// 未启用或无命中则原样返回。大小写不敏感。
+    pub fn resolve_alias(&self, requested: &str) -> String {
+        if !self.enabled {
+            return requested.to_string();
+        }
+        let needle = requested.trim().to_lowercase();
+        self.mappings
+            .iter()
+            .find(|m| m.enabled && m.alias.trim().to_lowercase() == needle)
+            .map(|m| m.target.clone())
+            .unwrap_or_else(|| requested.to_string())
+    }
+
+    /// 反查：上游实际模型名 → 下游展示用的 alias。
+    /// 未启用、未开启隐藏或无命中则返回 None。大小写不敏感。
+    pub fn alias_for_target(&self, target: &str) -> Option<String> {
+        if !self.enabled || !self.hide_mapped_targets {
+            return None;
+        }
+        let needle = target.trim().to_lowercase();
+        self.mappings
+            .iter()
+            .find(|m| m.enabled && m.target.trim().to_lowercase() == needle)
+            .map(|m| m.alias.clone())
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -117,6 +311,14 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 模拟缓存优化器配置
+    #[serde(default)]
+    pub cache_optimizer: CacheOptimizerConfig,
+
+    /// 模型映射配置
+    #[serde(default)]
+    pub model_mapping: ModelMappingConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -202,6 +404,8 @@ impl Default for Config {
             prompt_cache_accounting_enabled: default_true(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            cache_optimizer: CacheOptimizerConfig::default(),
+            model_mapping: ModelMappingConfig::default(),
             config_path: None,
         }
     }

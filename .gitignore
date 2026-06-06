@@ -18,3 +18,9 @@
 **/kiro_balance_cache.json
 **/kiro_stats.json
 /正式环境基础文件备份/
+
+# 运行时产生的临时文件
+/stdout.log
+/stderr.log
+/.junnl.pid
+

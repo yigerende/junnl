@@ -2,13 +2,19 @@ import { useState, useEffect } from 'react'
 import { storage } from '@/lib/storage'
 import { LoginPage } from '@/components/login-page'
 import { Dashboard } from '@/components/dashboard'
+import { CacheOptimizer } from '@/components/cache-optimizer'
+import { ModelMapping } from '@/components/model-mapping'
+import { CallLog } from '@/components/call-log'
 import { Toaster } from '@/components/ui/sonner'
+import { AppLayout } from '@/components/app-layout'
+
+type Page = 'credentials' | 'cache-optimizer' | 'model-mapping' | 'call-log'
 
 function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false)
+  const [currentPage, setCurrentPage] = useState<Page>('credentials')
 
   useEffect(() => {
-    // 检查是否已经有保存的 API Key
     if (storage.getApiKey()) {
       setIsLoggedIn(true)
     }
@@ -25,7 +31,12 @@ function App() {
   return (
     <>
       {isLoggedIn ? (
-        <Dashboard onLogout={handleLogout} />
+        <AppLayout currentPage={currentPage} onNavigate={setCurrentPage} onLogout={handleLogout}>
+          {currentPage === 'credentials' && <Dashboard />}
+          {currentPage === 'cache-optimizer' && <CacheOptimizer />}
+          {currentPage === 'model-mapping' && <ModelMapping />}
+          {currentPage === 'call-log' && <CallLog />}
+        </AppLayout>
       ) : (
         <LoginPage onLogin={handleLogin} />
       )}

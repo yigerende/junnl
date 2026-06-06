@@ -144,6 +144,7 @@ async fn main() {
         endpoints,
         config.default_endpoint.clone(),
     );
+    let kiro_provider = Arc::new(kiro_provider);
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -154,13 +155,25 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
+    // 创建共享的模拟缓存配置（Anthropic AppState 和 Admin Service 共用）
+    let cache_optimizer = std::sync::Arc::new(parking_lot::RwLock::new(config.cache_optimizer.clone()));
+
+    // 创建共享的模型映射配置（Anthropic AppState 和 Admin Service 共用）
+    let model_mapping = std::sync::Arc::new(parking_lot::RwLock::new(config.model_mapping.clone()));
+
+    // 创建共享的调用日志（Anthropic AppState 和 Admin Service 共用）
+    let call_log = anthropic::CallLog::default();
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
-        Some(kiro_provider),
+        Some(kiro_provider.clone()),
         config.extract_thinking,
         config.prompt_cache_ttl_seconds,
         config.prompt_cache_accounting_enabled,
+        cache_optimizer.clone(),
+        model_mapping.clone(),
+        call_log.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -177,7 +190,11 @@ async fn main() {
             anthropic_app
         } else {
             let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
+                admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
+                    .with_cache_optimizer(cache_optimizer.clone())
+                    .with_model_mapping(model_mapping.clone())
+                    .with_provider(kiro_provider.clone())
+                    .with_call_log(call_log.clone());
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 

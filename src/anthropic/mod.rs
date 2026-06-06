@@ -23,6 +23,8 @@
 //! ```
 
 mod cache_tracker;
+pub(crate) mod cache_rewriter;
+pub(crate) mod call_log;
 mod converter;
 mod handlers;
 mod middleware;
@@ -31,4 +33,5 @@ mod stream;
 pub mod types;
 mod websearch;
 
+pub use call_log::CallLog;
 pub use router::create_router_with_provider;

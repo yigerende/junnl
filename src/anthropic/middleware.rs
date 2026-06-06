@@ -13,8 +13,10 @@ use axum::{
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
+use crate::model::config::{CacheOptimizerConfig, ModelMappingConfig};
 
 use super::cache_tracker::CacheTracker;
+use super::call_log::CallLog;
 use super::types::ErrorResponse;
 
 #[derive(Clone)]
@@ -36,6 +38,12 @@ pub struct AppState {
     pub extract_thinking: bool,
     /// 本地 Prompt Cache usage 记账快照
     pub prompt_cache: PromptCacheSnapshot,
+    /// 模拟缓存优化器配置（运行时可热更新）
+    pub cache_optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>,
+    /// 模型映射配置（运行时可热更新）
+    pub model_mapping: Arc<parking_lot::RwLock<ModelMappingConfig>>,
+    /// 调用日志（内存环形缓冲）
+    pub call_log: CallLog,
 }
 
 impl AppState {
@@ -45,6 +53,9 @@ impl AppState {
         extract_thinking: bool,
         prompt_cache_ttl_seconds: u64,
         prompt_cache_accounting_enabled: bool,
+        cache_optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>,
+        model_mapping: Arc<parking_lot::RwLock<ModelMappingConfig>>,
+        call_log: CallLog,
     ) -> Self {
         Self {
             api_key: api_key.into(),
@@ -57,12 +68,15 @@ impl AppState {
                     prompt_cache_ttl_seconds,
                 ))),
             },
+            cache_optimizer,
+            model_mapping,
+            call_log,
         }
     }
 
-    /// 设置 KiroProvider
-    pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
-        self.kiro_provider = Some(Arc::new(provider));
+    /// 设置已包装的 KiroProvider（与 Admin 共享同一实例）
+    pub fn with_kiro_provider_arc(mut self, provider: Arc<KiroProvider>) -> Self {
+        self.kiro_provider = Some(provider);
         self
     }
 
