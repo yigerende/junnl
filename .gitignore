@@ -11,3 +11,10 @@
 /credentials.*
 /kiro_balance_cache.json
 /kiro_stats.json
+
+# 任意层级的真实配置/凭证（防止备份文件夹等误提交，不影响 *.example.* 示例文件）
+**/config.json
+**/credentials.json
+**/kiro_balance_cache.json
+**/kiro_stats.json
+/正式环境基础文件备份/
