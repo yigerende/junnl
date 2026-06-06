@@ -1462,6 +1462,18 @@ impl BufferedStreamContext {
             .map(|cache_usage| billed_input_tokens(final_input_tokens, cache_usage))
             .unwrap_or(final_input_tokens);
 
+        // 如果模拟缓存开启且配置了 input 随机上限，替换 message_start 的 input_tokens
+        // （与 message_delta 保持一致，否则缓冲流式下游读到的是 message_start 的真实大值）
+        let reported_input_tokens = if let Some(optimizer) = &self.inner.cache_optimizer {
+            super::cache_rewriter::rewrite_input_tokens(
+                &optimizer.read(),
+                self.inner.response_path,
+            )
+            .unwrap_or(reported_input_tokens)
+        } else {
+            reported_input_tokens
+        };
+
         // 更正 message_start 事件中的 input_tokens
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
@@ -1481,6 +1493,12 @@ impl BufferedStreamContext {
                             }
                         }
                     }
+                }
+            } else if event.event == "message_delta" {
+                // 与 message_start 保持一致：inner.generate_final_events 可能已用另一个随机值，
+                // 这里统一覆盖为同一个 reported_input_tokens，避免缓冲流式下两处不一致
+                if let Some(usage) = event.data.get_mut("usage") {
+                    usage["input_tokens"] = serde_json::json!(reported_input_tokens);
                 }
             }
         }
