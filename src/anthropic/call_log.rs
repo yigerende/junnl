@@ -33,6 +33,30 @@ pub struct CallLogEntry {
     pub endpoint: String,
     /// 是否命中模型映射（下游 != 上游）
     pub mapped: bool,
+    /// 来源 IP（X-Forwarded-For / X-Real-IP，反代后的真实来源）
+    #[serde(default)]
+    pub client_ip: Option<String>,
+    /// 来源域名（Host 头，访问用的中转域名）
+    #[serde(default)]
+    pub client_host: Option<String>,
+    /// 实际使用的凭据 ID
+    #[serde(default)]
+    pub credential_id: Option<u64>,
+    /// 该凭据累计请求次数（含本次、含失败）
+    #[serde(default)]
+    pub credential_request_count: Option<u64>,
+    /// 会话 ID（conversationId，用于核对同会话是否进同凭据）
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    /// conversationId 来源（metadata / x-session-id / ... / random）
+    #[serde(default)]
+    pub conversation_id_source: Option<String>,
+    /// 是否命中会话亲和（balanced 模式复用了已绑定凭据）
+    #[serde(default)]
+    pub session_affinity_hit: bool,
+    /// 本次请求是否成功（true=2xx 正常完成）
+    #[serde(default)]
+    pub success: bool,
 }
 
 /// 调用日志环形缓冲
@@ -70,13 +94,7 @@ impl CallLog {
     /// 获取最近的日志（按时间倒序，最新在前），最多 limit 条
     pub fn recent(&self, limit: usize) -> Vec<CallLogEntry> {
         let inner = self.inner.read();
-        inner
-            .entries
-            .iter()
-            .rev()
-            .take(limit)
-            .cloned()
-            .collect()
+        inner.entries.iter().rev().take(limit).cloned().collect()
     }
 
     /// 清空所有日志

@@ -143,9 +143,7 @@ pub fn init() -> Option<WorkerGuard> {
     // 文件层独立过滤器：默认只落 WARN+，避免 INFO 噪音撑爆磁盘。
     let file_filter = file_filter();
 
-    let console_layer = fmt::layer()
-        .with_target(true)
-        .with_filter(console_filter);
+    let console_layer = fmt::layer().with_target(true).with_filter(console_filter);
 
     let file_layer = fmt::layer()
         .json()

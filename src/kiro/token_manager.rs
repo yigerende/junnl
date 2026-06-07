@@ -483,6 +483,8 @@ struct CredentialEntry {
     disabled_reason: Option<DisabledReason>,
     /// API 调用成功次数
     success_count: u64,
+    /// API 调用总请求次数（含失败，每次选中即 +1）
+    request_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
 }
@@ -508,6 +510,8 @@ enum DisabledReason {
 #[derive(Serialize, Deserialize)]
 struct StatsEntry {
     success_count: u64,
+    #[serde(default)]
+    request_count: u64,
     last_used_at: Option<String>,
 }
 
@@ -545,6 +549,8 @@ pub struct CredentialEntrySnapshot {
     pub email: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
+    /// API 调用总请求次数（含失败）
+    pub request_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理
@@ -628,6 +634,9 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+    /// 本次是否命中会话亲和（balanced 模式下复用了已绑定凭据）。
+    /// 仅用于调用日志展示，不参与任何调度决策。
+    pub session_affinity_hit: bool,
 }
 
 impl MultiTokenManager {
@@ -681,6 +690,7 @@ impl MultiTokenManager {
                         None
                     },
                     success_count: 0,
+                    request_count: 0,
                     last_used_at: None,
                 }
             })
@@ -927,7 +937,7 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials) = {
+            let (id, credentials, affinity_hit) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
                 let session_hit = if is_balanced {
@@ -935,6 +945,8 @@ impl MultiTokenManager {
                 } else {
                     None
                 };
+                // 记录是否命中会话亲和（仅供日志，不影响调度）
+                let affinity_hit = session_hit.is_some();
 
                 // balanced 模式：有会话绑定时优先复用绑定凭据，否则重新均衡选择
                 // priority 模式：优先使用 current_id 指向的凭据
@@ -954,7 +966,7 @@ impl MultiTokenManager {
                 };
 
                 if let Some(hit) = session_hit.or(current_hit) {
-                    hit
+                    (hit.0, hit.1, affinity_hit)
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
                     let mut best = self.select_next_credential(model);
@@ -984,7 +996,7 @@ impl MultiTokenManager {
                         // 更新 current_id
                         let mut current_id = self.current_id.lock();
                         *current_id = new_id;
-                        (new_id, new_creds)
+                        (new_id, new_creds, false)
                     } else {
                         let entries = self.entries.lock();
                         // 注意：必须在 bail! 之前计算 available_count，
@@ -998,7 +1010,16 @@ impl MultiTokenManager {
 
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
-                Ok(ctx) => {
+                Ok(mut ctx) => {
+                    ctx.session_affinity_hit = affinity_hit;
+                    // 该凭据被选中并即将发起请求：总请求次数 +1（含后续可能失败）
+                    {
+                        let mut entries = self.entries.lock();
+                        if let Some(entry) = entries.iter_mut().find(|e| e.id == ctx.id) {
+                            entry.request_count += 1;
+                        }
+                    }
+                    self.save_stats_debounced();
                     if self.is_balanced_mode() {
                         if let Some(session_key) = session_key {
                             self.remember_session_affinity(session_key, ctx.id);
@@ -1074,6 +1095,7 @@ impl MultiTokenManager {
                 id,
                 credentials: credentials.clone(),
                 token,
+                session_affinity_hit: false,
             });
         }
 
@@ -1143,6 +1165,7 @@ impl MultiTokenManager {
             id,
             credentials: creds,
             token,
+            session_affinity_hit: false,
         })
     }
 
@@ -1237,6 +1260,7 @@ impl MultiTokenManager {
         for entry in entries.iter_mut() {
             if let Some(s) = stats.get(&entry.id.to_string()) {
                 entry.success_count = s.success_count;
+                entry.request_count = s.request_count;
                 entry.last_used_at = s.last_used_at.clone();
             }
         }
@@ -1261,6 +1285,7 @@ impl MultiTokenManager {
                         e.id.to_string(),
                         StatsEntry {
                             success_count: e.success_count,
+                            request_count: e.request_count,
                             last_used_at: e.last_used_at.clone(),
                         },
                     )
@@ -1296,6 +1321,16 @@ impl MultiTokenManager {
         if should_flush {
             self.save_stats();
         }
+    }
+
+    /// 获取指定凭据的总请求次数（含失败）。未找到返回 0。
+    pub fn get_request_count(&self, id: u64) -> u64 {
+        self.entries
+            .lock()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.request_count)
+            .unwrap_or(0)
     }
 
     /// 报告指定凭据 API 调用成功
@@ -1631,6 +1666,7 @@ impl MultiTokenManager {
                     },
                     email: e.credentials.email.clone(),
                     success_count: e.success_count,
+                    request_count: e.request_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
@@ -2014,6 +2050,7 @@ impl MultiTokenManager {
                 disabled: false,
                 disabled_reason: None,
                 success_count: 0,
+                request_count: 0,
                 last_used_at: None,
             });
         }

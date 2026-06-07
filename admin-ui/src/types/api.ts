@@ -148,4 +148,12 @@ export interface CallLogEntry {
   stream: boolean
   endpoint: string
   mapped: boolean
+  clientIp?: string | null
+  clientHost?: string | null
+  credentialId?: number | null
+  credentialRequestCount?: number | null
+  conversationId?: string | null
+  conversationIdSource?: string | null
+  sessionAffinityHit?: boolean
+  success?: boolean
 }

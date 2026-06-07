@@ -21,7 +21,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request};
+use super::converter::{ConversionError, SessionHint, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, CacheUsageBreakdown, SseEvent, StreamContext};
 use super::types::{
@@ -38,16 +38,11 @@ fn new_request_id() -> String {
     format!("r_{}", &s[..10])
 }
 
-/// 应用模型映射并记录调用日志。
+/// 应用模型映射（内部逻辑不变，仅替换 payload.model）。
 ///
-/// 把下游请求的模型名替换为上游实际模型名（内部逻辑不变），
-/// 同时向调用日志写入一条记录（下游模型、上游模型、是否流式、端点、是否命中映射）。
-fn apply_model_mapping_and_log(
-    state: &AppState,
-    payload: &mut MessagesRequest,
-    endpoint: &str,
-    stream: bool,
-) {
+/// 返回 (下游原始模型, 上游实际模型, 是否命中映射)，供调用方在请求完成后记录日志。
+/// 注意：此函数**不再**记录调用日志——日志改为在请求完成、拿到凭据后记录。
+fn apply_model_mapping(state: &AppState, payload: &mut MessagesRequest) -> (String, String, bool) {
     let downstream = payload.model.clone();
     let upstream = state.model_mapping.read().resolve_alias(&downstream);
     let mapped = upstream != downstream;
@@ -55,14 +50,116 @@ fn apply_model_mapping_and_log(
         tracing::info!(from = %downstream, to = %upstream, "模型映射生效");
         payload.model = upstream.clone();
     }
-    state.call_log.record(super::call_log::CallLogEntry {
-        timestamp_ms: chrono::Utc::now().timestamp_millis(),
-        downstream_model: downstream,
-        upstream_model: upstream,
-        stream,
-        endpoint: endpoint.to_string(),
-        mapped,
-    });
+    (downstream, upstream, mapped)
+}
+
+/// 调用日志上下文：入口提取后传给各出口，在请求完成、拿到 credential_id 后记录。
+#[derive(Clone)]
+struct CallLogContext {
+    call_log: super::call_log::CallLog,
+    downstream_model: String,
+    upstream_model: String,
+    mapped: bool,
+    stream: bool,
+    endpoint: String,
+    client_ip: Option<String>,
+    client_host: Option<String>,
+    conversation_id: Option<String>,
+    conversation_id_source: Option<String>,
+}
+
+impl CallLogContext {
+    /// 在请求完成后写入一条调用日志。
+    /// `provider` 用于查询该凭据的累计请求次数；`credential_id` 为本次实际使用的凭据；
+    /// `affinity_hit` 为是否命中会话亲和。
+    fn record(
+        &self,
+        provider: Option<&crate::kiro::provider::KiroProvider>,
+        credential_id: Option<u64>,
+        affinity_hit: bool,
+        success: bool,
+    ) {
+        let credential_request_count = match (credential_id, provider) {
+            (Some(id), Some(p)) => Some(p.get_request_count(id)),
+            _ => None,
+        };
+        self.call_log.record(super::call_log::CallLogEntry {
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            downstream_model: self.downstream_model.clone(),
+            upstream_model: self.upstream_model.clone(),
+            stream: self.stream,
+            endpoint: self.endpoint.clone(),
+            mapped: self.mapped,
+            client_ip: self.client_ip.clone(),
+            client_host: self.client_host.clone(),
+            credential_id,
+            credential_request_count,
+            conversation_id: self.conversation_id.clone(),
+            conversation_id_source: self.conversation_id_source.clone(),
+            session_affinity_hit: affinity_hit,
+            success,
+        });
+    }
+}
+
+/// 从请求头提取来源 IP：X-Forwarded-For（第一个）→ X-Real-IP。
+fn extract_client_ip(headers: &axum::http::HeaderMap) -> Option<String> {
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        if let Some(first) = xff.split(',').next() {
+            let ip = first.trim();
+            if !ip.is_empty() {
+                return Some(ip.to_string());
+            }
+        }
+    }
+    headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 从请求头提取来源域名（Host）。
+fn extract_client_host(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 从上游请求体(kiro 格式)提取 conversationId（与 provider 的会话亲和提取逻辑一致）。
+fn extract_conversation_id(request_body: &str) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(request_body).ok()?;
+    json.get("conversationState")?
+        .get("conversationId")?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// 从请求头提取会话标识候选，构造 SessionHint。
+/// 按优先级收集 X-Session-Id / X-Conversation-Id / X-Claude-Code-Session-Id，
+/// 供 convert_request 在 metadata.user_id 之外补充会话来源。
+fn build_session_hint(headers: &axum::http::HeaderMap) -> SessionHint {
+    let mut candidates = Vec::new();
+    for name in [
+        "x-session-id",
+        "x-conversation-id",
+        "x-claude-code-session-id",
+    ] {
+        if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            let v = v.trim();
+            if !v.is_empty() {
+                candidates.push(super::converter::SessionCandidate {
+                    value: v.to_string(),
+                    source: name,
+                });
+            }
+        }
+    }
+    SessionHint { candidates }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -508,6 +605,7 @@ pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
 )]
 pub async fn post_messages(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -536,9 +634,21 @@ pub async fn post_messages(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    // 应用模型映射 + 记录调用日志（内部逻辑不变）
+    // 应用模型映射（内部逻辑不变）。日志改为请求完成后在出口记录。
     let is_stream = payload.stream;
-    apply_model_mapping_and_log(&state, &mut payload, "/v1", is_stream);
+    let (downstream_model, upstream_model, mapped) = apply_model_mapping(&state, &mut payload);
+    let mut log_ctx = CallLogContext {
+        call_log: state.call_log.clone(),
+        downstream_model,
+        upstream_model,
+        mapped,
+        stream: is_stream,
+        endpoint: "/v1".to_string(),
+        client_ip: extract_client_ip(&headers),
+        client_host: extract_client_host(&headers),
+        conversation_id: None,        // 在 request_body(kiro格式) 就绪后补充
+        conversation_id_source: None, // 在转换后从 ConversionResult 补充
+    };
 
     let prompt_cache = state.prompt_cache_snapshot();
 
@@ -569,12 +679,13 @@ pub async fn post_messages(
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        log_ctx.record(None, None, false, resp.status().is_success());
+        return resp;
     }
 
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request(&payload, Some(&build_session_hint(&headers))) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -593,6 +704,8 @@ pub async fn post_messages(
                 .into_response();
         }
     };
+    // 记录 conversationId 来源（供调用日志展示）
+    log_ctx.conversation_id_source = Some(conversion_result.conversation_id_source.to_string());
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
@@ -617,6 +730,9 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
+    // request_body(kiro格式) 就绪后提取 conversationId 补入日志上下文
+    log_ctx.conversation_id = extract_conversation_id(&request_body);
+
     // 检查是否启用了thinking
     let thinking_enabled = payload
         .thinking
@@ -640,6 +756,7 @@ pub async fn post_messages(
             thinking_enabled,
             tool_name_map,
             state.cache_optimizer.clone(),
+            log_ctx,
         )
         .await
     } else {
@@ -657,6 +774,7 @@ pub async fn post_messages(
             extract_thinking,
             tool_name_map,
             state.cache_optimizer.clone(),
+            log_ctx,
         )
         .await
     }
@@ -672,7 +790,10 @@ async fn handle_stream_request(
     cache_tracker: Option<&std::sync::Arc<crate::anthropic::cache_tracker::CacheTracker>>,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
-    cache_optimizer: std::sync::Arc<parking_lot::RwLock<crate::model::config::CacheOptimizerConfig>>,
+    cache_optimizer: std::sync::Arc<
+        parking_lot::RwLock<crate::model::config::CacheOptimizerConfig>,
+    >,
+    log_ctx: CallLogContext,
 ) -> Response {
     let req_started = std::time::Instant::now();
     // 调用 Kiro API（支持多凭据故障转移）
@@ -685,9 +806,18 @@ async fn handle_stream_request(
                 elapsed_ms = req_started.elapsed().as_millis() as u64,
                 "流式请求上游连接失败"
             );
+            // 记录失败的调用日志（未选到可用凭据）
+            log_ctx.record(Some(provider.as_ref()), None, false, false);
             return map_provider_error(e);
         }
     };
+    // 记录调用日志：已选中凭据并连上上游
+    log_ctx.record(
+        Some(provider.as_ref()),
+        Some(api_result.credential_id),
+        api_result.session_affinity_hit,
+        true,
+    );
     tracing::info!(
         event = "stream_upstream_connected",
         credential_id = api_result.credential_id,
@@ -887,13 +1017,27 @@ async fn handle_non_stream_request(
     cache_tracker: Option<&std::sync::Arc<crate::anthropic::cache_tracker::CacheTracker>>,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
-    cache_optimizer: std::sync::Arc<parking_lot::RwLock<crate::model::config::CacheOptimizerConfig>>,
+    cache_optimizer: std::sync::Arc<
+        parking_lot::RwLock<crate::model::config::CacheOptimizerConfig>,
+    >,
+    log_ctx: CallLogContext,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let api_result = match provider.call_api(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            // 记录失败的调用日志（未选到可用凭据）
+            log_ctx.record(Some(provider.as_ref()), None, false, false);
+            return map_provider_error(e);
+        }
     };
+    // 记录调用日志：已选中凭据并连上上游
+    log_ctx.record(
+        Some(provider.as_ref()),
+        Some(api_result.credential_id),
+        api_result.session_affinity_hit,
+        true,
+    );
 
     let final_cache_context = match (cache_tracker, cache_profile) {
         (Some(tracker), Some(profile)) => {
@@ -1252,6 +1396,7 @@ pub async fn count_tokens(
 )]
 pub async fn post_messages_cc(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -1281,9 +1426,21 @@ pub async fn post_messages_cc(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    // 应用模型映射 + 记录调用日志（内部逻辑不变）
+    // 应用模型映射（内部逻辑不变）。日志改为请求完成后在出口记录。
     let is_stream = payload.stream;
-    apply_model_mapping_and_log(&state, &mut payload, "/cc/v1", is_stream);
+    let (downstream_model, upstream_model, mapped) = apply_model_mapping(&state, &mut payload);
+    let mut log_ctx = CallLogContext {
+        call_log: state.call_log.clone(),
+        downstream_model,
+        upstream_model,
+        mapped,
+        stream: is_stream,
+        endpoint: "/cc/v1".to_string(),
+        client_ip: extract_client_ip(&headers),
+        client_host: extract_client_host(&headers),
+        conversation_id: None,        // 在 request_body(kiro格式) 就绪后补充
+        conversation_id_source: None, // 在转换后从 ConversionResult 补充
+    };
 
     let prompt_cache = state.prompt_cache_snapshot();
 
@@ -1314,12 +1471,13 @@ pub async fn post_messages_cc(
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        log_ctx.record(None, None, false, resp.status().is_success());
+        return resp;
     }
 
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request(&payload, Some(&build_session_hint(&headers))) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -1338,6 +1496,8 @@ pub async fn post_messages_cc(
                 .into_response();
         }
     };
+    // 记录 conversationId 来源（供调用日志展示）
+    log_ctx.conversation_id_source = Some(conversion_result.conversation_id_source.to_string());
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
@@ -1362,6 +1522,9 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
+    // request_body(kiro格式) 就绪后提取 conversationId 补入日志上下文
+    log_ctx.conversation_id = extract_conversation_id(&request_body);
+
     // 检查是否启用了thinking
     let thinking_enabled = payload
         .thinking
@@ -1385,6 +1548,7 @@ pub async fn post_messages_cc(
             thinking_enabled,
             tool_name_map,
             state.cache_optimizer.clone(),
+            log_ctx,
         )
         .await
     } else {
@@ -1402,6 +1566,7 @@ pub async fn post_messages_cc(
             extract_thinking,
             tool_name_map,
             state.cache_optimizer.clone(),
+            log_ctx,
         )
         .await
     }
@@ -1420,13 +1585,25 @@ async fn handle_stream_request_buffered(
     cache_tracker: Option<&std::sync::Arc<crate::anthropic::cache_tracker::CacheTracker>>,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
-    cache_optimizer: std::sync::Arc<parking_lot::RwLock<crate::model::config::CacheOptimizerConfig>>,
+    cache_optimizer: std::sync::Arc<
+        parking_lot::RwLock<crate::model::config::CacheOptimizerConfig>,
+    >,
+    log_ctx: CallLogContext,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let api_result = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            log_ctx.record(Some(provider.as_ref()), None, false, false);
+            return map_provider_error(e);
+        }
     };
+    log_ctx.record(
+        Some(provider.as_ref()),
+        Some(api_result.credential_id),
+        api_result.session_affinity_hit,
+        true,
+    );
 
     let final_cache_context = match (cache_tracker, cache_profile) {
         (Some(tracker), Some(profile)) => {
@@ -1648,9 +1825,18 @@ mod ops_cache_tests {
             ..Default::default()
         };
         let usage = build_nonstream_usage(cache_context, &config);
-        assert_eq!(usage["cache_creation_input_tokens"], 22_000, "写 cap 到 22000");
-        assert_eq!(usage["cache_read_input_tokens"], 150_000, "读 150000 < 165000 不变");
-        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 22_000, "5m 同步");
+        assert_eq!(
+            usage["cache_creation_input_tokens"], 22_000,
+            "写 cap 到 22000"
+        );
+        assert_eq!(
+            usage["cache_read_input_tokens"], 150_000,
+            "读 150000 < 165000 不变"
+        );
+        assert_eq!(
+            usage["cache_creation"]["ephemeral_5m_input_tokens"], 22_000,
+            "5m 同步"
+        );
         assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 0);
     }
 
@@ -1675,8 +1861,14 @@ mod ops_cache_tests {
         let usage = build_nonstream_usage(cache_context, &config);
         assert_eq!(usage["cache_creation_input_tokens"], 480_000);
         assert_eq!(usage["cache_read_input_tokens"], 150_000);
-        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 300_000);
-        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 180_000);
+        assert_eq!(
+            usage["cache_creation"]["ephemeral_5m_input_tokens"],
+            300_000
+        );
+        assert_eq!(
+            usage["cache_creation"]["ephemeral_1h_input_tokens"],
+            180_000
+        );
     }
 
     #[test]
@@ -1700,14 +1892,38 @@ mod ops_cache_tests {
             rewrite_only_when_present: true,
             use_segment_weights: true,
             read_segments: vec![
-                CacheSegment { min: 15_000, max: 70_000, weight: 18 },
-                CacheSegment { min: 70_001, max: 110_000, weight: 52 },
-                CacheSegment { min: 110_001, max: 165_000, weight: 30 },
+                CacheSegment {
+                    min: 15_000,
+                    max: 70_000,
+                    weight: 18,
+                },
+                CacheSegment {
+                    min: 70_001,
+                    max: 110_000,
+                    weight: 52,
+                },
+                CacheSegment {
+                    min: 110_001,
+                    max: 165_000,
+                    weight: 30,
+                },
             ],
             write_segments: vec![
-                CacheSegment { min: 5, max: 800, weight: 72 },
-                CacheSegment { min: 801, max: 6500, weight: 24 },
-                CacheSegment { min: 6501, max: 22_000, weight: 4 },
+                CacheSegment {
+                    min: 5,
+                    max: 800,
+                    weight: 72,
+                },
+                CacheSegment {
+                    min: 801,
+                    max: 6500,
+                    weight: 24,
+                },
+                CacheSegment {
+                    min: 6501,
+                    max: 22_000,
+                    weight: 4,
+                },
             ],
             ..Default::default()
         };
@@ -1723,11 +1939,21 @@ mod ops_cache_tests {
             let usage = build_nonstream_usage(cache_context, &config);
             let creation = usage["cache_creation_input_tokens"].as_i64().unwrap();
             let read = usage["cache_read_input_tokens"].as_i64().unwrap();
-            assert!(creation == 0 || (5..=22_000).contains(&creation), "creation {creation} 越界");
-            assert!(read == 0 || (15_000..=165_000).contains(&read), "read {read} 越界");
+            assert!(
+                creation == 0 || (5..=22_000).contains(&creation),
+                "creation {creation} 越界"
+            );
+            assert!(
+                read == 0 || (15_000..=165_000).contains(&read),
+                "read {read} 越界"
+            );
             assert_ne!(creation, 480_000, "写未被改写");
-            let m5 = usage["cache_creation"]["ephemeral_5m_input_tokens"].as_i64().unwrap_or(0);
-            let h1 = usage["cache_creation"]["ephemeral_1h_input_tokens"].as_i64().unwrap_or(0);
+            let m5 = usage["cache_creation"]["ephemeral_5m_input_tokens"]
+                .as_i64()
+                .unwrap_or(0);
+            let h1 = usage["cache_creation"]["ephemeral_1h_input_tokens"]
+                .as_i64()
+                .unwrap_or(0);
             assert_eq!(m5 + h1, creation, "5m+1h 必须等于写总值");
         }
     }

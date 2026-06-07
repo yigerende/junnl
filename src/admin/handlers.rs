@@ -361,9 +361,7 @@ pub struct LogDownloadQuery {
 /// 采用**流式读取**（边读边发），避免把整个文件读进内存——当天日志可能很大
 /// （高峰期可达 GB 级），一次性读入会触发 OOM / 超时，导致浏览器报 Failed to fetch。
 pub async fn download_log_file(Query(q): Query<LogDownloadQuery>) -> impl IntoResponse {
-    let name = q
-        .file
-        .unwrap_or_else(crate::logging::today_log_filename);
+    let name = q.file.unwrap_or_else(crate::logging::today_log_filename);
 
     // 严格校验文件名：仅允许 app.YYYY-MM-DD，拒绝任何路径分隔符 / 穿越。
     if !crate::logging::is_valid_log_filename(&name) {

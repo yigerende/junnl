@@ -8,8 +8,8 @@ use axum::{
 use super::{
     handlers::{
         add_credential, clear_call_logs, delete_credential, download_log_file, force_refresh_token,
-        get_all_credentials, get_available_models, get_cache_optimizer, get_call_logs,
-        get_cached_balances, get_credential_balance, get_load_balancing_mode, get_log_info,
+        get_all_credentials, get_available_models, get_cache_optimizer, get_cached_balances,
+        get_call_logs, get_credential_balance, get_load_balancing_mode, get_log_info,
         get_model_mapping, get_runtime_logs, reset_failure_count, set_cache_optimizer,
         set_call_log_capacity, set_credential_disabled, set_credential_overage,
         set_credential_priority, set_load_balancing_mode, set_model_mapping, stream_runtime_logs,
@@ -62,10 +62,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_model_mapping).put(set_model_mapping),
         )
         .route("/available-models", get(get_available_models))
-        .route(
-            "/call-logs",
-            get(get_call_logs).delete(clear_call_logs),
-        )
+        .route("/call-logs", get(get_call_logs).delete(clear_call_logs))
         .route("/call-logs/capacity", put(set_call_log_capacity))
         .route("/logs", get(get_runtime_logs))
         .route("/logs/stream", get(stream_runtime_logs))

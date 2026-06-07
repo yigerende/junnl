@@ -324,7 +324,12 @@ mod tests {
         config.read_max = 165_000;
         config.write_max = 22_000;
         let (read, creation, c5m, c1h) = rewrite_cache_usage_with_split(
-            150_000, 480_000, 480_000, 0, &config, ResponsePath::Buffered,
+            150_000,
+            480_000,
+            480_000,
+            0,
+            &config,
+            ResponsePath::Buffered,
         );
         assert_eq!(read, 150_000); // < 165000，cap 不变
         assert_eq!(creation, 22_000); // cap 到上限
@@ -339,9 +344,8 @@ mod tests {
         // cap 模式但总值未超上限 → 拆分保持原样。
         let mut config = make_config("cap", true);
         config.write_max = 100_000;
-        let (_read, creation, c5m, c1h) = rewrite_cache_usage_with_split(
-            0, 8000, 5000, 3000, &config, ResponsePath::NonStream,
-        );
+        let (_read, creation, c5m, c1h) =
+            rewrite_cache_usage_with_split(0, 8000, 5000, 3000, &config, ResponsePath::NonStream);
         assert_eq!(creation, 8000); // 8000 < 100000，不变
         assert_eq!(c5m, 5000); // 原样保留
         assert_eq!(c1h, 3000);
@@ -354,13 +358,23 @@ mod tests {
         config.read_max = 1;
         config.write_max = 1;
         config.input_random_max = 99;
-        for path in [ResponsePath::Stream, ResponsePath::NonStream, ResponsePath::Buffered] {
+        for path in [
+            ResponsePath::Stream,
+            ResponsePath::NonStream,
+            ResponsePath::Buffered,
+        ] {
             let (r, c, m5, h1) =
                 rewrite_cache_usage_with_split(150_000, 480_000, 300_000, 180_000, &config, path);
-            assert_eq!((r, c, m5, h1), (150_000, 480_000, 300_000, 180_000),
-                "关闭时四字段必须原样返回");
-            assert_eq!(rewrite_input_tokens(&config, path), None,
-                "关闭时 input 不改写");
+            assert_eq!(
+                (r, c, m5, h1),
+                (150_000, 480_000, 300_000, 180_000),
+                "关闭时四字段必须原样返回"
+            );
+            assert_eq!(
+                rewrite_input_tokens(&config, path),
+                None,
+                "关闭时 input 不改写"
+            );
         }
     }
 
@@ -369,7 +383,12 @@ mod tests {
         // 开启但 mode=passthrough：等同关闭，原样返回。
         let config = make_config("passthrough", true);
         let (r, c, m5, h1) = rewrite_cache_usage_with_split(
-            150_000, 480_000, 300_000, 180_000, &config, ResponsePath::Buffered,
+            150_000,
+            480_000,
+            300_000,
+            180_000,
+            &config,
+            ResponsePath::Buffered,
         );
         assert_eq!((r, c, m5, h1), (150_000, 480_000, 300_000, 180_000));
     }
@@ -393,14 +412,38 @@ mod tests {
             rewrite_only_when_present: true,
             use_segment_weights: true,
             read_segments: vec![
-                CacheSegment { min: 15_000, max: 70_000, weight: 18 },
-                CacheSegment { min: 70_001, max: 110_000, weight: 52 },
-                CacheSegment { min: 110_001, max: 165_000, weight: 30 },
+                CacheSegment {
+                    min: 15_000,
+                    max: 70_000,
+                    weight: 18,
+                },
+                CacheSegment {
+                    min: 70_001,
+                    max: 110_000,
+                    weight: 52,
+                },
+                CacheSegment {
+                    min: 110_001,
+                    max: 165_000,
+                    weight: 30,
+                },
             ],
             write_segments: vec![
-                CacheSegment { min: 5, max: 800, weight: 72 },
-                CacheSegment { min: 801, max: 6500, weight: 24 },
-                CacheSegment { min: 6501, max: 22_000, weight: 4 },
+                CacheSegment {
+                    min: 5,
+                    max: 800,
+                    weight: 72,
+                },
+                CacheSegment {
+                    min: 801,
+                    max: 6500,
+                    weight: 24,
+                },
+                CacheSegment {
+                    min: 6501,
+                    max: 22_000,
+                    weight: 4,
+                },
             ],
             ..Default::default()
         }
@@ -413,7 +456,12 @@ mod tests {
         let config = prod_weighted_config();
         for _ in 0..1000 {
             let (read, creation, c5m, c1h) = rewrite_cache_usage_with_split(
-                150_000, 480_000, 480_000, 0, &config, ResponsePath::Buffered,
+                150_000,
+                480_000,
+                480_000,
+                0,
+                &config,
+                ResponsePath::Buffered,
             );
             // 写：要么 0（writeOnly 形态不会发生，因为上游有读有写 + readWrite 权重高，
             // 但 readOnly 形态会让写=0），要么落在 [5, 22000]

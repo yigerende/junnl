@@ -154,7 +154,8 @@ async fn main() {
     });
 
     // 创建共享的模拟缓存配置（Anthropic AppState 和 Admin Service 共用）
-    let cache_optimizer = std::sync::Arc::new(parking_lot::RwLock::new(config.cache_optimizer.clone()));
+    let cache_optimizer =
+        std::sync::Arc::new(parking_lot::RwLock::new(config.cache_optimizer.clone()));
 
     // 创建共享的模型映射配置（Anthropic AppState 和 Admin Service 共用）
     let model_mapping = std::sync::Arc::new(parking_lot::RwLock::new(config.model_mapping.clone()));

@@ -111,16 +111,40 @@ fn default_weight_read_write() -> u32 {
 }
 fn default_read_segments() -> Vec<CacheSegment> {
     vec![
-        CacheSegment { min: 90000, max: 110000, weight: 35 },
-        CacheSegment { min: 110001, max: 130000, weight: 45 },
-        CacheSegment { min: 130001, max: 145000, weight: 20 },
+        CacheSegment {
+            min: 90000,
+            max: 110000,
+            weight: 35,
+        },
+        CacheSegment {
+            min: 110001,
+            max: 130000,
+            weight: 45,
+        },
+        CacheSegment {
+            min: 130001,
+            max: 145000,
+            weight: 20,
+        },
     ]
 }
 fn default_write_segments() -> Vec<CacheSegment> {
     vec![
-        CacheSegment { min: 20, max: 200, weight: 55 },
-        CacheSegment { min: 201, max: 800, weight: 35 },
-        CacheSegment { min: 801, max: 3000, weight: 10 },
+        CacheSegment {
+            min: 20,
+            max: 200,
+            weight: 55,
+        },
+        CacheSegment {
+            min: 201,
+            max: 800,
+            weight: 35,
+        },
+        CacheSegment {
+            min: 801,
+            max: 3000,
+            weight: 10,
+        },
     ]
 }
 

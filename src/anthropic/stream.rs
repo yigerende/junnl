@@ -1416,7 +1416,10 @@ impl BufferedStreamContext {
         }
     }
 
-    pub fn set_cache_optimizer(&mut self, optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>) {
+    pub fn set_cache_optimizer(
+        &mut self,
+        optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>,
+    ) {
         self.inner.cache_optimizer = Some(optimizer);
         self.inner.response_path = super::cache_rewriter::ResponsePath::Buffered;
     }
@@ -1492,11 +1495,8 @@ impl BufferedStreamContext {
         // 如果模拟缓存开启且配置了 input 随机上限，替换 message_start 的 input_tokens
         // （与 message_delta 保持一致，否则缓冲流式下游读到的是 message_start 的真实大值）
         let reported_input_tokens = if let Some(optimizer) = &self.inner.cache_optimizer {
-            super::cache_rewriter::rewrite_input_tokens(
-                &optimizer.read(),
-                self.inner.response_path,
-            )
-            .unwrap_or(reported_input_tokens)
+            super::cache_rewriter::rewrite_input_tokens(&optimizer.read(), self.inner.response_path)
+                .unwrap_or(reported_input_tokens)
         } else {
             reported_input_tokens
         };
@@ -2650,9 +2650,18 @@ mod tests {
             .expect("should emit message_delta");
         let usage = &message_delta.data["usage"];
 
-        assert_eq!(usage["cache_creation_input_tokens"], 22_000, "写应被 cap 到 22000");
-        assert_eq!(usage["cache_read_input_tokens"], 50_000, "读应被 cap 到 50000");
-        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 22_000, "5m 同步到改写后总值");
+        assert_eq!(
+            usage["cache_creation_input_tokens"], 22_000,
+            "写应被 cap 到 22000"
+        );
+        assert_eq!(
+            usage["cache_read_input_tokens"], 50_000,
+            "读应被 cap 到 50000"
+        );
+        assert_eq!(
+            usage["cache_creation"]["ephemeral_5m_input_tokens"], 22_000,
+            "5m 同步到改写后总值"
+        );
         assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 0);
     }
 
@@ -2676,14 +2685,38 @@ mod tests {
             rewrite_only_when_present: true,
             use_segment_weights: true,
             read_segments: vec![
-                CacheSegment { min: 15_000, max: 70_000, weight: 18 },
-                CacheSegment { min: 70_001, max: 110_000, weight: 52 },
-                CacheSegment { min: 110_001, max: 165_000, weight: 30 },
+                CacheSegment {
+                    min: 15_000,
+                    max: 70_000,
+                    weight: 18,
+                },
+                CacheSegment {
+                    min: 70_001,
+                    max: 110_000,
+                    weight: 52,
+                },
+                CacheSegment {
+                    min: 110_001,
+                    max: 165_000,
+                    weight: 30,
+                },
             ],
             write_segments: vec![
-                CacheSegment { min: 5, max: 800, weight: 72 },
-                CacheSegment { min: 801, max: 6500, weight: 24 },
-                CacheSegment { min: 6501, max: 22_000, weight: 4 },
+                CacheSegment {
+                    min: 5,
+                    max: 800,
+                    weight: 72,
+                },
+                CacheSegment {
+                    min: 801,
+                    max: 6500,
+                    weight: 24,
+                },
+                CacheSegment {
+                    min: 6501,
+                    max: 22_000,
+                    weight: 4,
+                },
             ],
             ..Default::default()
         }
@@ -2710,20 +2743,35 @@ mod tests {
                 HashMap::new(),
             );
             ctx.context_input_tokens = Some(200_000); // 避开 scale
-            ctx.cache_optimizer = Some(Arc::new(parking_lot::RwLock::new(prod_weighted_optimizer())));
+            ctx.cache_optimizer = Some(Arc::new(parking_lot::RwLock::new(
+                prod_weighted_optimizer(),
+            )));
             ctx.response_path = crate::anthropic::cache_rewriter::ResponsePath::Stream;
 
             let events = ctx.generate_final_events();
-            let md = events.iter().find(|e| e.event == "message_delta").expect("message_delta");
+            let md = events
+                .iter()
+                .find(|e| e.event == "message_delta")
+                .expect("message_delta");
             let usage = &md.data["usage"];
             let creation = usage["cache_creation_input_tokens"].as_i64().unwrap();
             let read = usage["cache_read_input_tokens"].as_i64().unwrap();
-            assert!(creation == 0 || (5..=22_000).contains(&creation), "creation {creation} 越界");
-            assert!(read == 0 || (15_000..=165_000).contains(&read), "read {read} 越界");
+            assert!(
+                creation == 0 || (5..=22_000).contains(&creation),
+                "creation {creation} 越界"
+            );
+            assert!(
+                read == 0 || (15_000..=165_000).contains(&read),
+                "read {read} 越界"
+            );
             assert_ne!(creation, 90_000, "写未被改写");
             // 5m/1h 同步
-            let m5 = usage["cache_creation"]["ephemeral_5m_input_tokens"].as_i64().unwrap_or(0);
-            let h1 = usage["cache_creation"]["ephemeral_1h_input_tokens"].as_i64().unwrap_or(0);
+            let m5 = usage["cache_creation"]["ephemeral_5m_input_tokens"]
+                .as_i64()
+                .unwrap_or(0);
+            let h1 = usage["cache_creation"]["ephemeral_1h_input_tokens"]
+                .as_i64()
+                .unwrap_or(0);
             assert_eq!(m5 + h1, creation, "5m+1h 必须等于写总值");
         }
     }
@@ -2748,18 +2796,33 @@ mod tests {
                 false,
                 HashMap::new(),
             );
-            ctx.set_cache_optimizer(Arc::new(parking_lot::RwLock::new(prod_weighted_optimizer())));
+            ctx.set_cache_optimizer(Arc::new(
+                parking_lot::RwLock::new(prod_weighted_optimizer()),
+            ));
 
             let events = ctx.finish_and_get_all_events();
-            let ms = events.iter().find(|e| e.event == "message_start").expect("message_start");
+            let ms = events
+                .iter()
+                .find(|e| e.event == "message_start")
+                .expect("message_start");
             let usage = &ms.data["message"]["usage"];
             let creation = usage["cache_creation_input_tokens"].as_i64().unwrap();
             let read = usage["cache_read_input_tokens"].as_i64().unwrap();
-            assert!(creation == 0 || (5..=22_000).contains(&creation), "creation {creation} 越界");
-            assert!(read == 0 || (15_000..=165_000).contains(&read), "read {read} 越界");
+            assert!(
+                creation == 0 || (5..=22_000).contains(&creation),
+                "creation {creation} 越界"
+            );
+            assert!(
+                read == 0 || (15_000..=165_000).contains(&read),
+                "read {read} 越界"
+            );
             assert_ne!(creation, 90_000, "写未被改写");
-            let m5 = usage["cache_creation"]["ephemeral_5m_input_tokens"].as_i64().unwrap_or(0);
-            let h1 = usage["cache_creation"]["ephemeral_1h_input_tokens"].as_i64().unwrap_or(0);
+            let m5 = usage["cache_creation"]["ephemeral_5m_input_tokens"]
+                .as_i64()
+                .unwrap_or(0);
+            let h1 = usage["cache_creation"]["ephemeral_1h_input_tokens"]
+                .as_i64()
+                .unwrap_or(0);
             assert_eq!(m5 + h1, creation, "5m+1h 必须等于写总值");
         }
     }

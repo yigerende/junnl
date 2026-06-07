@@ -193,6 +193,8 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
+    /// conversationId 的来源（metadata / x-session-id / ... / random），供调用日志展示
+    pub conversation_id_source: &'static str,
 }
 
 /// 转换错误
@@ -219,6 +221,44 @@ impl std::error::Error for ConversionError {}
 /// 1. 字符串格式: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
 /// 2. JSON 格式: {"device_id":"...","account_uuid":"...","session_id":"UUID"}
 ///
+/// 下游请求携带的会话线索（来自 HTTP 头），由 handler 提取后传入。
+/// 用于在 metadata.user_id 之外，补充更多稳定会话标识来源，
+/// 让同一对话尽量复用同一 conversationId（上游据此接续上下文 + 命中缓存）。
+#[derive(Debug, Clone, Default)]
+pub struct SessionHint {
+    /// 按优先级排列的候选会话标识（带来源标记）
+    pub candidates: Vec<SessionCandidate>,
+}
+
+/// 单个会话标识候选：值 + 来源名（用于调用日志展示来自哪个头）
+#[derive(Debug, Clone)]
+pub struct SessionCandidate {
+    pub value: String,
+    /// 来源标记，如 "x-session-id" / "x-conversation-id" / "x-claude-code-session-id"
+    pub source: &'static str,
+}
+
+/// 命名空间 UUID，用于把任意会话标识确定性映射为稳定 UUID（v5）。
+/// 固定常量保证同一标识每次得到同一 UUID。
+const SESSION_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
+    0x6b, 0x61, 0x69, 0x72, 0x6f, 0x2d, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x69, 0x64, 0x21,
+]);
+
+/// 把候选会话标识规整为合法 conversationId（UUID 格式）。
+/// - 本身是合法 UUID → 直接用
+/// - 非 UUID（但非空）→ 用 UUID v5 确定性映射成稳定 UUID
+/// - 空白 → None
+fn normalize_session_to_uuid(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if is_valid_uuid(s) {
+        return Some(s.to_string());
+    }
+    Some(uuid::Uuid::new_v5(&SESSION_NAMESPACE, s.as_bytes()).to_string())
+}
+
 /// 提取 session UUID 作为 conversationId
 fn extract_session_id(user_id: &str) -> Option<String> {
     // 先尝试 JSON 解析
@@ -286,7 +326,10 @@ fn create_placeholder_tool(name: &str) -> Tool {
 }
 
 /// 将 Anthropic 请求转换为 Kiro 请求
-pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
+pub fn convert_request(
+    req: &MessagesRequest,
+    session_hint: Option<&SessionHint>,
+) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
     let model_id = map_model(&req.model)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
@@ -311,12 +354,27 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     };
 
     // 3. 生成会话 ID 和代理 ID
-    // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
+    // 按优先级提取稳定会话标识作为 conversationId（命中即用，短路），并记录来源。
+    let mut conversation_id_source = "random";
     let conversation_id = req
         .metadata
         .as_ref()
         .and_then(|m| m.user_id.as_ref())
         .and_then(|user_id| extract_session_id(user_id))
+        .map(|id| {
+            conversation_id_source = "metadata";
+            id
+        })
+        .or_else(|| {
+            session_hint.and_then(|hint| {
+                hint.candidates.iter().find_map(|c| {
+                    normalize_session_to_uuid(&c.value).map(|id| {
+                        conversation_id_source = c.source;
+                        id
+                    })
+                })
+            })
+        })
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let agent_continuation_id = Uuid::new_v4().to_string();
 
@@ -396,6 +454,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,
+        conversation_id_source,
     })
 }
 
@@ -1210,7 +1269,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, None).unwrap();
 
         // 应该有映射
         assert_eq!(result.tool_name_map.len(), 1);
@@ -1279,7 +1338,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, None).unwrap();
         let short_name = result.tool_name_map.iter().next().unwrap().0.clone();
 
         // 历史中 assistant 消息的 tool_use name 也应该被映射
@@ -1336,7 +1395,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, None).unwrap();
 
         // 验证 tools 列表中包含了历史中使用的工具的占位符定义
         let tools = &result
@@ -1424,7 +1483,7 @@ mod tests {
             }),
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, None).unwrap();
         assert_eq!(
             result.conversation_state.conversation_id,
             "a0662283-7fd3-4399-a7eb-52b9a717ae88"
@@ -1452,7 +1511,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, None).unwrap();
         // 验证生成的是有效的 UUID 格式
         assert_eq!(result.conversation_state.conversation_id.len(), 36);
         assert_eq!(
@@ -1888,7 +1947,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req);
+        let result = convert_request(&req, None);
         assert!(
             result.is_ok(),
             "连续 assistant 消息场景不应报错: {:?}",
@@ -1908,5 +1967,53 @@ mod tests {
             }
         }
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
+    }
+
+    #[test]
+    fn test_normalize_session_to_uuid() {
+        // 合法 UUID 原样返回
+        let u = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(normalize_session_to_uuid(u), Some(u.to_string()));
+        // 非 UUID → v5 稳定映射，且同一输入每次相同
+        let a1 = normalize_session_to_uuid("my-session-abc").unwrap();
+        let a2 = normalize_session_to_uuid("my-session-abc").unwrap();
+        assert_eq!(a1, a2, "同一标识必须映射到同一 UUID");
+        assert!(is_valid_uuid(&a1), "映射结果必须是合法 UUID");
+        // 不同输入 → 不同 UUID
+        let b = normalize_session_to_uuid("other-session").unwrap();
+        assert_ne!(a1, b);
+        // 空白 → None
+        assert_eq!(normalize_session_to_uuid("   "), None);
+    }
+
+    #[test]
+    fn test_session_hint_priority_in_convert() {
+        use super::super::types::Message as AnthropicMessage;
+        // 不带 metadata，但 SessionHint 提供候选 → conversationId 用候选（UUID 原样）
+        let sid = "550e8400-e29b-41d4-a716-446655440000";
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hi"),
+            }],
+            system: None,
+            stream: false,
+            tools: None,
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        };
+        let hint = SessionHint {
+            candidates: vec![SessionCandidate {
+                value: sid.to_string(),
+                source: "x-session-id",
+            }],
+        };
+        let result = convert_request(&req, Some(&hint)).unwrap();
+        assert_eq!(result.conversation_state.conversation_id, sid);
+        assert_eq!(result.conversation_id_source, "x-session-id");
     }
 }

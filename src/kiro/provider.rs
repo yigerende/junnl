@@ -24,6 +24,8 @@ use parking_lot::Mutex;
 pub struct ApiCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
+    /// 是否命中会话亲和（仅供调用日志展示）
+    pub session_affinity_hit: bool,
 }
 
 /// 每个凭据的最大重试次数
@@ -231,6 +233,11 @@ impl KiroProvider {
         }
 
         Ok(all_models)
+    }
+
+    /// 获取指定凭据的总请求次数（含失败），供调用日志展示。
+    pub fn get_request_count(&self, id: u64) -> u64 {
+        self.token_manager.get_request_count(id)
     }
 
     /// 发送非流式 API 请求
@@ -492,6 +499,7 @@ impl KiroProvider {
                 return Ok(ApiCallResult {
                     response,
                     credential_id: ctx.id,
+                    session_affinity_hit: ctx.session_affinity_hit,
                 });
             }
 

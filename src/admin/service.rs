@@ -73,12 +73,18 @@ impl AdminService {
         }
     }
 
-    pub fn with_cache_optimizer(mut self, optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>) -> Self {
+    pub fn with_cache_optimizer(
+        mut self,
+        optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>,
+    ) -> Self {
         self.cache_optimizer_live = Some(optimizer);
         self
     }
 
-    pub fn with_model_mapping(mut self, mapping: Arc<parking_lot::RwLock<ModelMappingConfig>>) -> Self {
+    pub fn with_model_mapping(
+        mut self,
+        mapping: Arc<parking_lot::RwLock<ModelMappingConfig>>,
+    ) -> Self {
         self.model_mapping_live = Some(mapping);
         self
     }
@@ -283,7 +289,11 @@ impl AdminService {
         // 延迟仍返回旧的 overageStatus。这里以本次操作的目标值为准覆盖，
         // 并据此重算总额度（开启=基础+超额，关闭=基础），保证前端立即正确。
         // 下次用户主动刷新余额时，上游已反映，数据自然一致。
-        balance.overage_status = if enabled { "ENABLED".to_string() } else { "DISABLED".to_string() };
+        balance.overage_status = if enabled {
+            "ENABLED".to_string()
+        } else {
+            "DISABLED".to_string()
+        };
         balance.total_limit = if enabled {
             balance.base_limit + balance.overage_cap
         } else {
@@ -443,9 +453,7 @@ impl AdminService {
             .config()
             .config_path()
             .map(|p| p.to_path_buf())
-            .ok_or_else(|| {
-                AdminServiceError::InternalError("配置文件路径未知".to_string())
-            })?;
+            .ok_or_else(|| AdminServiceError::InternalError("配置文件路径未知".to_string()))?;
 
         let mut config = Config::load(&config_path)
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
@@ -507,9 +515,7 @@ impl AdminService {
             .config()
             .config_path()
             .map(|p| p.to_path_buf())
-            .ok_or_else(|| {
-                AdminServiceError::InternalError("配置文件路径未知".to_string())
-            })?;
+            .ok_or_else(|| AdminServiceError::InternalError("配置文件路径未知".to_string()))?;
 
         let mut config = Config::load(&config_path)
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
@@ -528,9 +534,10 @@ impl AdminService {
 
     /// 拉取上游可用模型 ID 列表（供前端选择映射目标）
     pub async fn list_available_models(&self) -> Result<Vec<String>, AdminServiceError> {
-        let provider = self.provider.as_ref().ok_or_else(|| {
-            AdminServiceError::InternalError("Provider 未配置".to_string())
-        })?;
+        let provider = self
+            .provider
+            .as_ref()
+            .ok_or_else(|| AdminServiceError::InternalError("Provider 未配置".to_string()))?;
         let models = provider
             .list_available_models()
             .await

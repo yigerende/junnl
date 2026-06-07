@@ -22,8 +22,8 @@
 //! axum::serve(listener, app).await?;
 //! ```
 
-mod cache_tracker;
 pub(crate) mod cache_rewriter;
+mod cache_tracker;
 pub(crate) mod call_log;
 mod converter;
 mod handlers;
