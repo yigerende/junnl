@@ -23,7 +23,7 @@ const LEVEL_COLORS: Record<string, string> = {
   TRACE: 'text-muted-foreground',
 }
 
-const MAX_ROWS = 5000
+const MAX_ROWS = 1000
 
 function formatTime(ms: number): string {
   const d = new Date(ms)
@@ -39,13 +39,33 @@ export function RuntimeLog() {
   const [connected, setConnected] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
   const logsRef = useRef<LogRecord[]>([])
+  const pendingRef = useRef<LogRecord[]>([])
+  const flushTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  // 追加日志并保持上限（用 ref 避免闭包拿到旧 state）
+  // 追加日志：先入缓冲，由定时器每 500ms 批量 flush 一次，
+  // 避免每条 SSE 都触发整页重渲染导致卡死。
+  // pending 也设上限：极端日志洪峰时只保留最近 MAX_ROWS 条，防止单次 flush 处理过大数组。
   const append = useCallback((rec: LogRecord) => {
-    const next = [...logsRef.current, rec]
-    if (next.length > MAX_ROWS) next.splice(0, next.length - MAX_ROWS)
-    logsRef.current = next
-    setLogs(next)
+    const pending = pendingRef.current
+    pending.push(rec)
+    if (pending.length > MAX_ROWS) {
+      pending.splice(0, pending.length - MAX_ROWS)
+    }
+  }, [])
+
+  // 批量 flush 定时器
+  useEffect(() => {
+    flushTimerRef.current = setInterval(() => {
+      if (pendingRef.current.length === 0) return
+      const next = [...logsRef.current, ...pendingRef.current]
+      pendingRef.current = []
+      if (next.length > MAX_ROWS) next.splice(0, next.length - MAX_ROWS)
+      logsRef.current = next
+      setLogs(next)
+    }, 500)
+    return () => {
+      if (flushTimerRef.current) clearInterval(flushTimerRef.current)
+    }
   }, [])
 
   // 建立 SSE 连接：用 fetch + ReadableStream 以便携带 x-api-key 头
@@ -55,22 +75,24 @@ export function RuntimeLog() {
     let cancelled = false
 
     async function connect() {
-      // 先拉取最近历史
+      // 先拉取最近历史（限 300 条，避免首屏渲染过重）
       try {
-        const resp = await fetch('/api/admin/logs?limit=5000', {
+        const resp = await fetch('/api/admin/logs?limit=300', {
           headers: apiKey ? { 'x-api-key': apiKey } : {},
           signal: controller.signal,
         })
         if (resp.ok) {
           const data = await resp.json()
           if (!cancelled && Array.isArray(data.logs)) {
-            logsRef.current = data.logs
-            setLogs(data.logs)
+            logsRef.current = data.logs.slice(-MAX_ROWS)
+            setLogs(logsRef.current)
           }
         }
       } catch {
         /* 历史拉取失败不致命，继续订阅实时流 */
       }
+
+      if (cancelled) return
 
       // 订阅实时流
       try {
@@ -78,8 +100,11 @@ export function RuntimeLog() {
           headers: apiKey ? { 'x-api-key': apiKey } : {},
           signal: controller.signal,
         })
-        if (!resp.ok || !resp.body) return
-        setConnected(true)
+        if (!resp.ok || !resp.body) {
+          if (!cancelled) setConnected(false)
+          return
+        }
+        if (!cancelled) setConnected(true)
         const reader = resp.body.getReader()
         const decoder = new TextDecoder()
         let buffer = ''
@@ -87,7 +112,6 @@ export function RuntimeLog() {
           const { done, value } = await reader.read()
           if (done) break
           buffer += decoder.decode(value, { stream: true })
-          // SSE 以空行分隔事件；每个事件含 "data: <json>" 行
           const parts = buffer.split('\n\n')
           buffer = parts.pop() ?? ''
           for (const part of parts) {
