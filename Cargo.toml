@@ -15,6 +15,7 @@ strip = true
 axum = "0.8"
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["io"] }  # 文件流式响应（大日志下载不占内存）
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "socks", "rustls-tls-webpki-roots", "rustls-tls-native-roots", "http2", "system-proxy", "charset"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

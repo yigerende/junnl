@@ -266,7 +266,7 @@ export function RuntimeLog() {
           </p>
           {logDir && (
             <p className="text-xs text-muted-foreground mt-1">
-              落盘目录：<span className="font-mono">{logDir}</span>（按天滚动，留存 7 天）
+              落盘目录：<span className="font-mono">{logDir}</span>（仅 WARN+，按天滚动，留存 3 天）
             </p>
           )}
         </div>

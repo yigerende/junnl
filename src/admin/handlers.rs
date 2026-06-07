@@ -357,6 +357,9 @@ pub struct LogDownloadQuery {
 
 /// GET /api/admin/logs/download?file=app.YYYY-MM-DD
 /// 下载指定（默认当天）的落盘日志文件。文件名经严格校验，杜绝路径穿越。
+///
+/// 采用**流式读取**（边读边发），避免把整个文件读进内存——当天日志可能很大
+/// （高峰期可达 GB 级），一次性读入会触发 OOM / 超时，导致浏览器报 Failed to fetch。
 pub async fn download_log_file(Query(q): Query<LogDownloadQuery>) -> impl IntoResponse {
     let name = q
         .file
@@ -370,16 +373,21 @@ pub async fn download_log_file(Query(q): Query<LogDownloadQuery>) -> impl IntoRe
     let dir = crate::logging::log_dir_absolute();
     let path = dir.join(&name);
 
-    let content = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
+    // 打开文件句柄（不读内容），失败说明当天尚无 WARN+ 日志或文件不存在。
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
         Err(_) => {
             return (
                 StatusCode::NOT_FOUND,
-                format!("日志文件不存在：{name}（当天可能尚无日志产生）"),
+                format!("日志文件不存在或为空：{name}（当天可能尚无 WARN+ 日志产生）"),
             )
                 .into_response();
         }
     };
+
+    // 用 ReaderStream 把文件包成异步字节流，axum 边读边发，内存占用恒定。
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = Body::from_stream(stream);
 
     // 落盘为 JSON-lines，下载时用 .log 后缀，附带 Content-Disposition 触发浏览器下载。
     let download_name = format!("{name}.log");
@@ -391,7 +399,7 @@ pub async fn download_log_file(Query(q): Query<LogDownloadQuery>) -> impl IntoRe
                 format!("attachment; filename=\"{download_name}\""),
             ),
         ],
-        Body::from(content),
+        body,
     )
         .into_response()
 }

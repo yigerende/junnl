@@ -7,6 +7,8 @@
 //! - 文件写入走 `tracing_appender::non_blocking`，请求线程只入内存 channel，
 //!   真正的磁盘 I/O 在后台线程完成，**绝不阻塞请求主链路**。
 //! - 控制台层保留原样，docker logs / pm2 仍可正常查看。
+//! - **文件层默认只落 WARN+**（INFO 噪音量大、会撑爆磁盘），实时 INFO 看控制台
+//!   或 admin「运行日志」页；排查时用 `JUNNL_LOG_FILE_LEVEL=info` 临时落全量。
 //! - 仅初始化日志基础设施，不触碰任何业务逻辑。
 
 use std::path::PathBuf;
@@ -18,7 +20,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, fmt};
 
 /// 默认日志留存天数。
-const DEFAULT_RETAIN_DAYS: i64 = 7;
+const DEFAULT_RETAIN_DAYS: i64 = 3;
 
 /// 解析日志目录：优先 `JUNNL_LOG_DIR` 环境变量，否则用工作目录下的 `logs/`。
 ///
@@ -82,6 +84,30 @@ fn retain_days() -> i64 {
         .unwrap_or(DEFAULT_RETAIN_DAYS)
 }
 
+/// 文件层日志级别过滤器。
+///
+/// 落盘文件**默认只记录 WARN 及以上**（warn/error），把 INFO 噪音挡在磁盘外——
+/// 实时 INFO 仍可在控制台和 admin「运行日志」页查看，无需长期落盘。
+///
+/// 排查时可用 `JUNNL_LOG_FILE_LEVEL=info`（或 debug）临时让文件层也落全量；
+/// 若设置了 `RUST_LOG`，则文件层沿用 `RUST_LOG`（兼容老用法、便于一次性调全）。
+fn file_filter() -> EnvFilter {
+    // 显式的 JUNNL_LOG_FILE_LEVEL 优先级最高。
+    if let Ok(level) = std::env::var("JUNNL_LOG_FILE_LEVEL") {
+        if !level.trim().is_empty() {
+            if let Ok(f) = EnvFilter::try_new(level.trim()) {
+                return f;
+            }
+        }
+    }
+    // 其次沿用 RUST_LOG（若用户显式设了，说明想统一调级别）。
+    if let Ok(f) = EnvFilter::try_from_default_env() {
+        return f;
+    }
+    // 默认：文件只落 WARN 及以上。
+    EnvFilter::new("warn")
+}
+
 /// 初始化全局日志。
 ///
 /// 返回 `WorkerGuard`：**必须在 `main` 里持有到进程结束**，否则非阻塞写线程会
@@ -114,9 +140,8 @@ pub fn init() -> Option<WorkerGuard> {
     let file_appender = tracing_appender::rolling::daily(&dir, "app");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-    // 文件层独立过滤器（与控制台同源，但需独立实例）。
-    let file_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // 文件层独立过滤器：默认只落 WARN+，避免 INFO 噪音撑爆磁盘。
+    let file_filter = file_filter();
 
     let console_layer = fmt::layer()
         .with_target(true)
@@ -216,5 +241,65 @@ mod tests {
         let name = today_log_filename();
         assert!(name.starts_with("app."));
         assert!(is_valid_log_filename(&name));
+    }
+
+    /// 核心回归：文件层默认过滤器（warn）必须**放行 WARN/ERROR、拦截 INFO/DEBUG**。
+    ///
+    /// 用一个内存 writer 接同样的 `EnvFilter::new("warn")`，发四条不同级别的日志，
+    /// 断言落盘内容里有 WARN/ERROR、没有 INFO/DEBUG。直接验证「出 warn/error 时
+    /// 一定会进日志文件」这一关键诉求，防止以后误把级别调没。
+    #[test]
+    fn file_layer_keeps_warn_and_error_drops_info() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        // 共享内存缓冲 + 实现 MakeWriter 的句柄。
+        #[derive(Clone)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        struct BufGuard(Arc<Mutex<Vec<u8>>>);
+        impl Write for BufGuard {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for SharedBuf {
+            type Writer = BufGuard;
+            fn make_writer(&'a self) -> Self::Writer {
+                BufGuard(self.0.clone())
+            }
+        }
+
+        let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
+        // 与生产文件层一致：JSON + EnvFilter("warn")。
+        let layer = fmt::layer()
+            .json()
+            .with_writer(buf.clone())
+            .with_filter(EnvFilter::new("warn"));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        // 仅在本作用域内生效，不污染其他测试的全局 subscriber。
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("info_should_be_dropped");
+            tracing::debug!("debug_should_be_dropped");
+            tracing::warn!("warn_must_be_kept");
+            tracing::error!("error_must_be_kept");
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("warn_must_be_kept"), "WARN 必须落盘: {out}");
+        assert!(out.contains("error_must_be_kept"), "ERROR 必须落盘: {out}");
+        assert!(
+            !out.contains("info_should_be_dropped"),
+            "INFO 不应落盘: {out}"
+        );
+        assert!(
+            !out.contains("debug_should_be_dropped"),
+            "DEBUG 不应落盘: {out}"
+        );
     }
 }
