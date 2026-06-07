@@ -5,10 +5,11 @@ import { Dashboard } from '@/components/dashboard'
 import { CacheOptimizer } from '@/components/cache-optimizer'
 import { ModelMapping } from '@/components/model-mapping'
 import { CallLog } from '@/components/call-log'
+import { RuntimeLog } from '@/components/runtime-log'
 import { Toaster } from '@/components/ui/sonner'
 import { AppLayout } from '@/components/app-layout'
 
-type Page = 'credentials' | 'cache-optimizer' | 'model-mapping' | 'call-log'
+type Page = 'credentials' | 'cache-optimizer' | 'model-mapping' | 'call-log' | 'runtime-log'
 
 function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false)
@@ -36,6 +37,7 @@ function App() {
           {currentPage === 'cache-optimizer' && <CacheOptimizer />}
           {currentPage === 'model-mapping' && <ModelMapping />}
           {currentPage === 'call-log' && <CallLog />}
+          {currentPage === 'runtime-log' && <RuntimeLog />}
         </AppLayout>
       ) : (
         <LoginPage onLogin={handleLogin} />

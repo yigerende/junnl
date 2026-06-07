@@ -30,6 +30,14 @@ use super::types::{
 };
 use super::websearch;
 
+/// 生成一次请求的追踪 ID，形如 `r_ab12cd34ef`。
+///
+/// 仅用于把同一请求横跨多个函数的日志串联起来，不参与任何业务逻辑。
+fn new_request_id() -> String {
+    let s = Uuid::new_v4().simple().to_string();
+    format!("r_{}", &s[..10])
+}
+
 /// 应用模型映射并记录调用日志。
 ///
 /// 把下游请求的模型名替换为上游实际模型名（内部逻辑不变），
@@ -494,6 +502,10 @@ pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
+#[tracing::instrument(
+    skip_all,
+    fields(request_id = %new_request_id(), route = "/v1/messages")
+)]
 pub async fn post_messages(
     State(state): State<AppState>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
@@ -662,11 +674,26 @@ async fn handle_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     cache_optimizer: std::sync::Arc<parking_lot::RwLock<crate::model::config::CacheOptimizerConfig>>,
 ) -> Response {
+    let req_started = std::time::Instant::now();
     // 调用 Kiro API（支持多凭据故障转移）
     let api_result = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            tracing::warn!(
+                event = "stream_end",
+                reason = "upstream_connect_error",
+                elapsed_ms = req_started.elapsed().as_millis() as u64,
+                "流式请求上游连接失败"
+            );
+            return map_provider_error(e);
+        }
     };
+    tracing::info!(
+        event = "stream_upstream_connected",
+        credential_id = api_result.credential_id,
+        upstream_connect_ms = req_started.elapsed().as_millis() as u64,
+        "流式请求已连接上游"
+    );
 
     let final_cache_context = match (cache_tracker, cache_profile) {
         (Some(tracker), Some(profile)) => {
@@ -741,9 +768,16 @@ fn create_sse_stream(
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
 
+    // 捕获当前请求 span（含 request_id）。SSE 流是在 handler 返回后才被轮询的，
+    // 那时 instrument 的 span 已不活跃，所以这里捕获下来，打点时用 in_scope 临时进入。
+    let span = tracing::Span::current();
+    let stream_started = std::time::Instant::now();
+
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), false, 0u64),
+        move |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut first_byte_logged, mut ping_count)| {
+            let span = span.clone();
+            async move {
             if finished {
                 return None;
             }
@@ -754,6 +788,14 @@ fn create_sse_stream(
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
+                            if !first_byte_logged {
+                                first_byte_logged = true;
+                                span.in_scope(|| tracing::info!(
+                                    event = "stream_first_byte",
+                                    upstream_first_byte_ms = stream_started.elapsed().as_millis() as u64,
+                                    "流式上游首字节到达"
+                                ));
+                            }
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
                                 tracing::warn!("缓冲区溢出: {}", e);
@@ -780,35 +822,51 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, first_byte_logged, ping_count)))
                         }
                         Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {}", e);
+                            span.in_scope(|| tracing::error!(
+                                event = "stream_end",
+                                reason = "upstream_error",
+                                elapsed_ms = stream_started.elapsed().as_millis() as u64,
+                                ping_count = ping_count,
+                                error = %e,
+                                "流式读取上游失败"
+                            ));
                             // 发送最终事件并结束
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_byte_logged, ping_count)))
                         }
                         None => {
+                            span.in_scope(|| tracing::info!(
+                                event = "stream_end",
+                                reason = "upstream_done",
+                                elapsed_ms = stream_started.elapsed().as_millis() as u64,
+                                ping_count = ping_count,
+                                "流式正常结束"
+                            ));
                             // 流结束，发送最终事件
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_byte_logged, ping_count)))
                         }
                     }
                 }
                 // 发送 ping 保活
                 _ = ping_interval.tick() => {
+                    ping_count += 1;
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, first_byte_logged, ping_count)))
                 }
+            }
             }
         },
     )
@@ -1073,16 +1131,21 @@ async fn handle_non_stream_request(
             "output_tokens": output_tokens
         });
         if let Some(mut cache_context) = final_cache_context {
-            // 如果模拟缓存开启，改写 cache 字段
+            // 如果模拟缓存开启，改写 cache 字段（含 5m/1h 拆分同步）
             let optimizer_config = cache_optimizer.read();
-            let (new_read, new_write) = super::cache_rewriter::rewrite_cache_usage(
-                cache_context.cache_read_input_tokens,
-                cache_context.cache_creation_input_tokens,
-                &optimizer_config,
-                super::cache_rewriter::ResponsePath::NonStream,
-            );
+            let (new_read, new_write, new_5m, new_1h) =
+                super::cache_rewriter::rewrite_cache_usage_with_split(
+                    cache_context.cache_read_input_tokens,
+                    cache_context.cache_creation_input_tokens,
+                    cache_context.cache_creation_5m_input_tokens,
+                    cache_context.cache_creation_1h_input_tokens,
+                    &optimizer_config,
+                    super::cache_rewriter::ResponsePath::NonStream,
+                );
             cache_context.cache_read_input_tokens = new_read;
             cache_context.cache_creation_input_tokens = new_write;
+            cache_context.cache_creation_5m_input_tokens = new_5m;
+            cache_context.cache_creation_1h_input_tokens = new_1h;
             inject_cache_usage_fields(&mut usage, cache_context);
         }
 
@@ -1153,6 +1216,10 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 /// POST /v1/messages/count_tokens
 ///
 /// 计算消息的 token 数量
+#[tracing::instrument(
+    skip_all,
+    fields(request_id = %new_request_id(), route = "/v1/messages/count_tokens")
+)]
 pub async fn count_tokens(
     JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
 ) -> impl IntoResponse {
@@ -1179,6 +1246,10 @@ pub async fn count_tokens(
 /// Claude Code 兼容端点，与 /v1/messages 的区别在于：
 /// - 流式响应会等待 kiro 端返回 contextUsageEvent 后再发送 message_start
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
+#[tracing::instrument(
+    skip_all,
+    fields(request_id = %new_request_id(), route = "/cc/v1/messages")
+)]
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
@@ -1416,6 +1487,10 @@ fn create_buffered_sse_stream(
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
+    // 捕获当前请求 span（含 request_id），打点时用 in_scope 临时进入。
+    let span = tracing::Span::current();
+    let stream_started = std::time::Instant::now();
+
     stream::unfold(
         (
             body_stream,
@@ -1423,8 +1498,12 @@ fn create_buffered_sse_stream(
             EventStreamDecoder::new(),
             false,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            false,
+            0u64,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        move |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut first_byte_logged, mut ping_count)| {
+            let span = span.clone();
+            async move {
             if finished {
                 return None;
             }
@@ -1437,15 +1516,24 @@ fn create_buffered_sse_stream(
 
                     // 优先检查 ping 保活（等待期间唯一发送的数据）
                     _ = ping_interval.tick() => {
+                        ping_count += 1;
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, first_byte_logged, ping_count)));
                     }
 
                     // 然后处理数据流
                     chunk_result = body_stream.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
+                                if !first_byte_logged {
+                                    first_byte_logged = true;
+                                    span.in_scope(|| tracing::info!(
+                                        event = "stream_first_byte",
+                                        upstream_first_byte_ms = stream_started.elapsed().as_millis() as u64,
+                                        "流式上游首字节到达（缓冲模式）"
+                                    ));
+                                }
                                 // 解码事件
                                 if let Err(e) = decoder.feed(&chunk) {
                                     tracing::warn!("缓冲区溢出: {}", e);
@@ -1467,29 +1555,180 @@ fn create_buffered_sse_stream(
                                 // 继续读取下一个 chunk，不发送任何数据
                             }
                             Some(Err(e)) => {
-                                tracing::error!("读取响应流失败: {}", e);
+                                span.in_scope(|| tracing::error!(
+                                    event = "stream_end",
+                                    reason = "upstream_error",
+                                    elapsed_ms = stream_started.elapsed().as_millis() as u64,
+                                    ping_count = ping_count,
+                                    error = %e,
+                                    "流式读取上游失败（缓冲模式）"
+                                ));
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_byte_logged, ping_count)));
                             }
                             None => {
+                                span.in_scope(|| tracing::info!(
+                                    event = "stream_end",
+                                    reason = "upstream_done",
+                                    elapsed_ms = stream_started.elapsed().as_millis() as u64,
+                                    ping_count = ping_count,
+                                    "流式正常结束（缓冲模式）"
+                                ));
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_byte_logged, ping_count)));
                             }
                         }
                     }
                 }
             }
+            }
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod ops_cache_tests {
+    use super::*;
+    use crate::model::config::CacheOptimizerConfig;
+
+    // 复现非流式出口(handle_non_stream_request 构建 usage 的那段)的改写逻辑：
+    // rewrite_cache_usage_with_split + inject_cache_usage_fields。
+    // 验证开启时改写生效、5m/1h 同步；关闭时原样透传。
+    fn build_nonstream_usage(
+        mut cache_context: CacheUsageContext,
+        config: &CacheOptimizerConfig,
+    ) -> serde_json::Value {
+        let mut usage = serde_json::json!({ "input_tokens": 123, "output_tokens": 5 });
+        let (new_read, new_write, new_5m, new_1h) =
+            crate::anthropic::cache_rewriter::rewrite_cache_usage_with_split(
+                cache_context.cache_read_input_tokens,
+                cache_context.cache_creation_input_tokens,
+                cache_context.cache_creation_5m_input_tokens,
+                cache_context.cache_creation_1h_input_tokens,
+                config,
+                crate::anthropic::cache_rewriter::ResponsePath::NonStream,
+            );
+        cache_context.cache_read_input_tokens = new_read;
+        cache_context.cache_creation_input_tokens = new_write;
+        cache_context.cache_creation_5m_input_tokens = new_5m;
+        cache_context.cache_creation_1h_input_tokens = new_1h;
+        inject_cache_usage_fields(&mut usage, cache_context);
+        usage
+    }
+
+    #[test]
+    fn test_nonstream_rewrites_cache_usage() {
+        let cache_context = CacheUsageContext {
+            cache_creation_input_tokens: 480_000,
+            cache_read_input_tokens: 150_000,
+            cache_creation_5m_input_tokens: 480_000,
+            cache_creation_1h_input_tokens: 0,
+            cache_creation_ttl_known: true,
+            prefix_hit_input_jitter: 0,
+        };
+        let config = CacheOptimizerConfig {
+            enabled: true,
+            enabled_stream: true,
+            enabled_non_stream: true,
+            enabled_buffered: true,
+            mode: "cap".to_string(),
+            read_max: 165_000,
+            write_max: 22_000,
+            ..Default::default()
+        };
+        let usage = build_nonstream_usage(cache_context, &config);
+        assert_eq!(usage["cache_creation_input_tokens"], 22_000, "写 cap 到 22000");
+        assert_eq!(usage["cache_read_input_tokens"], 150_000, "读 150000 < 165000 不变");
+        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 22_000, "5m 同步");
+        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 0);
+    }
+
+    #[test]
+    fn test_nonstream_disabled_passes_through() {
+        let cache_context = CacheUsageContext {
+            cache_creation_input_tokens: 480_000,
+            cache_read_input_tokens: 150_000,
+            cache_creation_5m_input_tokens: 300_000,
+            cache_creation_1h_input_tokens: 180_000,
+            cache_creation_ttl_known: true,
+            prefix_hit_input_jitter: 0,
+        };
+        // 关闭：即便配了极小上限也不应改写。
+        let config = CacheOptimizerConfig {
+            enabled: false,
+            mode: "cap".to_string(),
+            read_max: 1,
+            write_max: 1,
+            ..Default::default()
+        };
+        let usage = build_nonstream_usage(cache_context, &config);
+        assert_eq!(usage["cache_creation_input_tokens"], 480_000);
+        assert_eq!(usage["cache_read_input_tokens"], 150_000);
+        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 300_000);
+        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 180_000);
+    }
+
+    #[test]
+    fn test_nonstream_weighted_in_range() {
+        use crate::model::config::CacheSegment;
+        // 非流式 + weighted（贴近正式配置）：跑多次，断言输出 usage 落在范围且 5m/1h 同步。
+        let config = CacheOptimizerConfig {
+            enabled: true,
+            enabled_stream: true,
+            enabled_non_stream: true,
+            enabled_buffered: true,
+            mode: "weighted".to_string(),
+            read_min: 15_000,
+            read_max: 165_000,
+            write_min: 5,
+            write_max: 22_000,
+            weight_read_only: 12,
+            weight_write_only: 8,
+            weight_read_write: 90,
+            weight_none: 0,
+            rewrite_only_when_present: true,
+            use_segment_weights: true,
+            read_segments: vec![
+                CacheSegment { min: 15_000, max: 70_000, weight: 18 },
+                CacheSegment { min: 70_001, max: 110_000, weight: 52 },
+                CacheSegment { min: 110_001, max: 165_000, weight: 30 },
+            ],
+            write_segments: vec![
+                CacheSegment { min: 5, max: 800, weight: 72 },
+                CacheSegment { min: 801, max: 6500, weight: 24 },
+                CacheSegment { min: 6501, max: 22_000, weight: 4 },
+            ],
+            ..Default::default()
+        };
+        for _ in 0..200 {
+            let cache_context = CacheUsageContext {
+                cache_creation_input_tokens: 480_000,
+                cache_read_input_tokens: 150_000,
+                cache_creation_5m_input_tokens: 480_000,
+                cache_creation_1h_input_tokens: 0,
+                cache_creation_ttl_known: true,
+                prefix_hit_input_jitter: 0,
+            };
+            let usage = build_nonstream_usage(cache_context, &config);
+            let creation = usage["cache_creation_input_tokens"].as_i64().unwrap();
+            let read = usage["cache_read_input_tokens"].as_i64().unwrap();
+            assert!(creation == 0 || (5..=22_000).contains(&creation), "creation {creation} 越界");
+            assert!(read == 0 || (15_000..=165_000).contains(&read), "read {read} 越界");
+            assert_ne!(creation, 480_000, "写未被改写");
+            let m5 = usage["cache_creation"]["ephemeral_5m_input_tokens"].as_i64().unwrap_or(0);
+            let h1 = usage["cache_creation"]["ephemeral_1h_input_tokens"].as_i64().unwrap_or(0);
+            assert_eq!(m5 + h1, creation, "5m+1h 必须等于写总值");
+        }
+    }
 }

@@ -10,7 +10,10 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 /// 默认保留条数
-pub const DEFAULT_CAPACITY: usize = 1000;
+///
+/// 5000 条约占 2-5 MB 内存，覆盖约 0.5-1 小时调用历史。下游多人打并发时，
+/// 旧值 1000 条几分钟就被刷没，截图过来往往看不到出错请求最初的入口日志。
+pub const DEFAULT_CAPACITY: usize = 5000;
 /// 容量上限（防止前端设置过大撑爆内存）
 const MAX_CAPACITY: usize = 100_000;
 

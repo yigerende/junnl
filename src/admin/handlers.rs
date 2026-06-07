@@ -4,7 +4,10 @@ use axum::{
     Json,
     extract::{Path, Query, State},
     response::IntoResponse,
+    response::sse::{Event, KeepAlive, Sse},
 };
+use futures::Stream;
+use std::convert::Infallible;
 
 use super::{
     middleware::AdminState,
@@ -230,4 +233,39 @@ pub async fn set_call_log_capacity(
 ) -> impl IntoResponse {
     let applied = state.service.set_call_log_capacity(payload.capacity);
     Json(serde_json::json!({ "capacity": applied }))
+}
+
+/// 运行日志拉取参数
+#[derive(serde::Deserialize)]
+pub struct RuntimeLogQuery {
+    pub limit: Option<usize>,
+}
+
+/// GET /api/admin/logs?limit=N
+/// 拉取最近的运行日志（时间正序）。供前端首次加载/补全历史。
+pub async fn get_runtime_logs(Query(q): Query<RuntimeLogQuery>) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(5000).clamp(1, 5000);
+    let logs = crate::log_buffer::global().recent(limit);
+    Json(serde_json::json!({ "logs": logs }))
+}
+
+/// GET /api/admin/logs/stream
+/// 通过 SSE 实时推送运行日志。前端用 EventSource 订阅，新日志实时滚动。
+pub async fn stream_runtime_logs() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    use tokio_stream::StreamExt;
+    use tokio_stream::wrappers::BroadcastStream;
+
+    let rx = crate::log_buffer::global().subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(|item| match item {
+        Ok(record) => {
+            // 序列化失败的极端情况直接跳过该条，不中断流。
+            serde_json::to_string(&record)
+                .ok()
+                .map(|json| Ok(Event::default().data(json)))
+        }
+        // 订阅者落后（Lagged）时丢弃，不中断流。
+        Err(_) => None,
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }

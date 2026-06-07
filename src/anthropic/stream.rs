@@ -1225,18 +1225,23 @@ impl StreamContext {
         let cache_usage = self.cache_usage.map(|cache_usage| {
             scale_cache_usage(cache_usage, self.input_tokens, final_input_tokens)
         });
-        // 如果模拟缓存开启，改写 cache 字段
+        // 如果模拟缓存开启，改写 cache 字段（含 5m/1h 拆分同步）
         let cache_usage = cache_usage.map(|mut cu| {
             if let Some(optimizer) = &self.cache_optimizer {
                 let config = optimizer.read();
-                let (new_read, new_write) = super::cache_rewriter::rewrite_cache_usage(
-                    cu.cache_read_input_tokens,
-                    cu.cache_creation_input_tokens,
-                    &config,
-                    self.response_path,
-                );
+                let (new_read, new_write, new_5m, new_1h) =
+                    super::cache_rewriter::rewrite_cache_usage_with_split(
+                        cu.cache_read_input_tokens,
+                        cu.cache_creation_input_tokens,
+                        cu.cache_creation_5m_input_tokens,
+                        cu.cache_creation_1h_input_tokens,
+                        &config,
+                        self.response_path,
+                    );
                 cu.cache_read_input_tokens = new_read;
                 cu.cache_creation_input_tokens = new_write;
+                cu.cache_creation_5m_input_tokens = new_5m;
+                cu.cache_creation_1h_input_tokens = new_1h;
             }
             cu
         });
@@ -1457,6 +1462,28 @@ impl BufferedStreamContext {
             .unwrap_or(self.inner.input_tokens);
         let cache_usage = self.inner.cache_usage.map(|cache_usage| {
             scale_cache_usage(cache_usage, self.inner.input_tokens, final_input_tokens)
+        });
+        // 如果模拟缓存开启，改写 cache 字段（含 5m/1h 拆分同步，与非缓冲/非流式一致）。
+        // 缓冲流式此前漏改这一步，导致 /cc/v1 的 message_start 写入上游真实缓存读写值，
+        // 绕过了配置的改写上限。
+        let cache_usage = cache_usage.map(|mut cu| {
+            if let Some(optimizer) = &self.inner.cache_optimizer {
+                let config = optimizer.read();
+                let (new_read, new_write, new_5m, new_1h) =
+                    super::cache_rewriter::rewrite_cache_usage_with_split(
+                        cu.cache_read_input_tokens,
+                        cu.cache_creation_input_tokens,
+                        cu.cache_creation_5m_input_tokens,
+                        cu.cache_creation_1h_input_tokens,
+                        &config,
+                        self.inner.response_path,
+                    );
+                cu.cache_read_input_tokens = new_read;
+                cu.cache_creation_input_tokens = new_write;
+                cu.cache_creation_5m_input_tokens = new_5m;
+                cu.cache_creation_1h_input_tokens = new_1h;
+            }
+            cu
         });
         let reported_input_tokens = cache_usage
             .map(|cache_usage| billed_input_tokens(final_input_tokens, cache_usage))
@@ -2475,5 +2502,265 @@ mod tests {
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
         );
+    }
+
+    #[test]
+    fn test_buffered_stream_rewrites_cache_usage_in_message_start() {
+        use crate::model::config::CacheOptimizerConfig;
+        use std::sync::Arc;
+
+        // 模拟：上游真实缓存写 480000（远超配置上限），cap 模式上限 22000。
+        let cache_usage = CacheUsageBreakdown {
+            cache_creation_input_tokens: 480_000,
+            cache_read_input_tokens: 150_000,
+            cache_creation_5m_input_tokens: 480_000,
+            cache_creation_1h_input_tokens: 0,
+            cache_creation_ttl_known: true,
+            prefix_hit_input_jitter: 0,
+        };
+        let mut ctx = BufferedStreamContext::new(
+            "claude-opus-4-7",
+            200_000,
+            Some(cache_usage),
+            false,
+            HashMap::new(),
+        );
+
+        let config = CacheOptimizerConfig {
+            enabled: true,
+            enabled_stream: true,
+            enabled_non_stream: true,
+            enabled_buffered: true,
+            mode: "cap".to_string(),
+            read_max: 165_000,
+            write_max: 22_000,
+            ..Default::default()
+        };
+        ctx.set_cache_optimizer(Arc::new(parking_lot::RwLock::new(config)));
+
+        let events = ctx.finish_and_get_all_events();
+        let message_start = events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .expect("should emit message_start");
+        let usage = &message_start.data["message"]["usage"];
+
+        // 缓冲流式此前漏改 cache 字段，会写入 480000；修复后应被 cap 到 22000。
+        assert_eq!(
+            usage["cache_creation_input_tokens"], 22_000,
+            "缓冲流式 message_start 的 cache_creation 必须经过改写上限"
+        );
+        assert_eq!(usage["cache_read_input_tokens"], 150_000); // 150000 < 165000，cap 不变
+        // 5m/1h 拆分应与改写后的总写值一致
+        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 22_000);
+        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 0);
+    }
+
+    #[test]
+    fn test_buffered_stream_disabled_passes_through_real_cache() {
+        use crate::model::config::CacheOptimizerConfig;
+        use std::sync::Arc;
+
+        // 关闭模拟缓存：message_start 必须原样输出（不经改写层）。
+        // 用不超过 input 的小 cache 值，避免触发既有的 scale/overflow 钳制，
+        // 从而纯粹验证「改写层在关闭时不介入」。
+        let cache_usage = CacheUsageBreakdown {
+            cache_creation_input_tokens: 800,
+            cache_read_input_tokens: 1500,
+            cache_creation_5m_input_tokens: 500,
+            cache_creation_1h_input_tokens: 300,
+            cache_creation_ttl_known: true,
+            prefix_hit_input_jitter: 0,
+        };
+        let mut ctx = BufferedStreamContext::new(
+            "claude-opus-4-7",
+            200_000,
+            Some(cache_usage),
+            false,
+            HashMap::new(),
+        );
+
+        // enabled=false：即便配了 cap 上限、input 随机，也不应改写任何值。
+        let config = CacheOptimizerConfig {
+            enabled: false,
+            enabled_stream: true,
+            enabled_non_stream: true,
+            enabled_buffered: true,
+            mode: "cap".to_string(),
+            read_max: 1,
+            write_max: 1,
+            input_random_max: 99,
+            ..Default::default()
+        };
+        ctx.set_cache_optimizer(Arc::new(parking_lot::RwLock::new(config)));
+
+        let events = ctx.finish_and_get_all_events();
+        let message_start = events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .expect("should emit message_start");
+        let usage = &message_start.data["message"]["usage"];
+
+        // 关闭时改写层不介入，原样透传（cache 值远小于 input，无 scale/overflow 影响）
+        assert_eq!(usage["cache_creation_input_tokens"], 800);
+        assert_eq!(usage["cache_read_input_tokens"], 1500);
+        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 500);
+        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 300);
+    }
+
+    #[test]
+    fn test_nonbuffered_stream_rewrites_cache_in_message_delta() {
+        use crate::model::config::CacheOptimizerConfig;
+        use std::sync::Arc;
+
+        // 非缓冲流式：cache 在最终 message_delta 输出。开启 cap 模式验证改写 + 5m/1h 同步。
+        // 设 estimated==actual(都是 200000)且 read+creation 不超 actual，避开 scale/overflow。
+        let cache_usage = CacheUsageBreakdown {
+            cache_creation_input_tokens: 90_000,
+            cache_read_input_tokens: 80_000,
+            cache_creation_5m_input_tokens: 90_000,
+            cache_creation_1h_input_tokens: 0,
+            cache_creation_ttl_known: true,
+            prefix_hit_input_jitter: 0,
+        };
+        let mut ctx = StreamContext::new_with_cache_usage(
+            "claude-opus-4-7",
+            200_000,
+            Some(cache_usage),
+            false,
+            HashMap::new(),
+        );
+        ctx.context_input_tokens = Some(200_000); // estimated==actual，scale 不改值
+        ctx.cache_optimizer = Some(Arc::new(parking_lot::RwLock::new(CacheOptimizerConfig {
+            enabled: true,
+            enabled_stream: true,
+            enabled_non_stream: true,
+            enabled_buffered: true,
+            mode: "cap".to_string(),
+            read_max: 50_000,
+            write_max: 22_000,
+            ..Default::default()
+        })));
+        ctx.response_path = crate::anthropic::cache_rewriter::ResponsePath::Stream;
+
+        let final_events = ctx.generate_final_events();
+        let message_delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should emit message_delta");
+        let usage = &message_delta.data["usage"];
+
+        assert_eq!(usage["cache_creation_input_tokens"], 22_000, "写应被 cap 到 22000");
+        assert_eq!(usage["cache_read_input_tokens"], 50_000, "读应被 cap 到 50000");
+        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 22_000, "5m 同步到改写后总值");
+        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 0);
+    }
+
+    /// 贴近正式环境的 weighted 配置（含读写分段权重），供流式端到端测试使用。
+    fn prod_weighted_optimizer() -> crate::model::config::CacheOptimizerConfig {
+        use crate::model::config::{CacheOptimizerConfig, CacheSegment};
+        CacheOptimizerConfig {
+            enabled: true,
+            enabled_stream: true,
+            enabled_non_stream: true,
+            enabled_buffered: true,
+            mode: "weighted".to_string(),
+            read_min: 15_000,
+            read_max: 165_000,
+            write_min: 5,
+            write_max: 22_000,
+            weight_read_only: 12,
+            weight_write_only: 8,
+            weight_read_write: 90,
+            weight_none: 0,
+            rewrite_only_when_present: true,
+            use_segment_weights: true,
+            read_segments: vec![
+                CacheSegment { min: 15_000, max: 70_000, weight: 18 },
+                CacheSegment { min: 70_001, max: 110_000, weight: 52 },
+                CacheSegment { min: 110_001, max: 165_000, weight: 30 },
+            ],
+            write_segments: vec![
+                CacheSegment { min: 5, max: 800, weight: 72 },
+                CacheSegment { min: 801, max: 6500, weight: 24 },
+                CacheSegment { min: 6501, max: 22_000, weight: 4 },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_nonbuffered_stream_weighted_in_range() {
+        use std::sync::Arc;
+        // 非缓冲流式 + weighted：跑多次，断言 message_delta 的 cache 落在配置范围且 5m/1h 同步。
+        for _ in 0..200 {
+            let cache_usage = CacheUsageBreakdown {
+                cache_creation_input_tokens: 90_000,
+                cache_read_input_tokens: 80_000,
+                cache_creation_5m_input_tokens: 90_000,
+                cache_creation_1h_input_tokens: 0,
+                cache_creation_ttl_known: true,
+                prefix_hit_input_jitter: 0,
+            };
+            let mut ctx = StreamContext::new_with_cache_usage(
+                "claude-opus-4-7",
+                200_000,
+                Some(cache_usage),
+                false,
+                HashMap::new(),
+            );
+            ctx.context_input_tokens = Some(200_000); // 避开 scale
+            ctx.cache_optimizer = Some(Arc::new(parking_lot::RwLock::new(prod_weighted_optimizer())));
+            ctx.response_path = crate::anthropic::cache_rewriter::ResponsePath::Stream;
+
+            let events = ctx.generate_final_events();
+            let md = events.iter().find(|e| e.event == "message_delta").expect("message_delta");
+            let usage = &md.data["usage"];
+            let creation = usage["cache_creation_input_tokens"].as_i64().unwrap();
+            let read = usage["cache_read_input_tokens"].as_i64().unwrap();
+            assert!(creation == 0 || (5..=22_000).contains(&creation), "creation {creation} 越界");
+            assert!(read == 0 || (15_000..=165_000).contains(&read), "read {read} 越界");
+            assert_ne!(creation, 90_000, "写未被改写");
+            // 5m/1h 同步
+            let m5 = usage["cache_creation"]["ephemeral_5m_input_tokens"].as_i64().unwrap_or(0);
+            let h1 = usage["cache_creation"]["ephemeral_1h_input_tokens"].as_i64().unwrap_or(0);
+            assert_eq!(m5 + h1, creation, "5m+1h 必须等于写总值");
+        }
+    }
+
+    #[test]
+    fn test_buffered_stream_weighted_in_range() {
+        use std::sync::Arc;
+        // 缓冲流式 /cc/v1 + weighted：跑多次，断言 message_start 的 cache 落在配置范围且 5m/1h 同步。
+        for _ in 0..200 {
+            let cache_usage = CacheUsageBreakdown {
+                cache_creation_input_tokens: 90_000,
+                cache_read_input_tokens: 80_000,
+                cache_creation_5m_input_tokens: 90_000,
+                cache_creation_1h_input_tokens: 0,
+                cache_creation_ttl_known: true,
+                prefix_hit_input_jitter: 0,
+            };
+            let mut ctx = BufferedStreamContext::new(
+                "claude-opus-4-7",
+                200_000,
+                Some(cache_usage),
+                false,
+                HashMap::new(),
+            );
+            ctx.set_cache_optimizer(Arc::new(parking_lot::RwLock::new(prod_weighted_optimizer())));
+
+            let events = ctx.finish_and_get_all_events();
+            let ms = events.iter().find(|e| e.event == "message_start").expect("message_start");
+            let usage = &ms.data["message"]["usage"];
+            let creation = usage["cache_creation_input_tokens"].as_i64().unwrap();
+            let read = usage["cache_read_input_tokens"].as_i64().unwrap();
+            assert!(creation == 0 || (5..=22_000).contains(&creation), "creation {creation} 越界");
+            assert!(read == 0 || (15_000..=165_000).contains(&read), "read {read} 越界");
+            assert_ne!(creation, 90_000, "写未被改写");
+            let m5 = usage["cache_creation"]["ephemeral_5m_input_tokens"].as_i64().unwrap_or(0);
+            let h1 = usage["cache_creation"]["ephemeral_1h_input_tokens"].as_i64().unwrap_or(0);
+            assert_eq!(m5 + h1, creation, "5m+1h 必须等于写总值");
+        }
     }
 }

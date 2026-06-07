@@ -46,6 +46,31 @@ pub(crate) fn rewrite_cache_usage(
     }
 }
 
+/// 改写缓存读写，并同步 5m/1h 拆分。
+///
+/// 在 `rewrite_cache_usage` 基础上，把 cache_creation 的 5m/1h 拆分同步到改写后的
+/// 总写值（归整到 5m，清空 1h），避免下游读到「总 cache_creation 与 5m+1h 拆分不一致」
+/// 的数据。下游 new-api 的 Claude 计费实际以 5m/1h 拆分值结算，若拆分值不同步，
+/// 改写会被架空。
+///
+/// 入参/返回均为 `(read, creation_total, creation_5m, creation_1h)`。
+pub(crate) fn rewrite_cache_usage_with_split(
+    raw_read: i32,
+    raw_creation: i32,
+    raw_5m: i32,
+    raw_1h: i32,
+    config: &CacheOptimizerConfig,
+    path: ResponsePath,
+) -> (i32, i32, i32, i32) {
+    let (new_read, new_creation) = rewrite_cache_usage(raw_read, raw_creation, config, path);
+    if new_creation == raw_creation {
+        // 总写值未变，拆分保持原样。
+        return (new_read, new_creation, raw_5m, raw_1h);
+    }
+    // 总写值被改写：把拆分归整到 5m，清空 1h，保证 5m+1h == 总值。
+    (new_read, new_creation, new_creation, 0)
+}
+
 /// 计算改写后的 input_tokens。
 ///
 /// 仅当模拟缓存开启、当前路径开启、且 `input_random_max > 0` 时，
@@ -290,5 +315,121 @@ mod tests {
         let mut config = make_config("weighted", true);
         config.input_random_max = 0;
         assert_eq!(rewrite_input_tokens(&config, ResponsePath::Stream), None);
+    }
+
+    #[test]
+    fn rewrite_with_split_syncs_5m_1h_when_total_changed() {
+        // cap 模式：写上限 22000，喂 480000 + 拆分(480000,0)。
+        let mut config = make_config("cap", true);
+        config.read_max = 165_000;
+        config.write_max = 22_000;
+        let (read, creation, c5m, c1h) = rewrite_cache_usage_with_split(
+            150_000, 480_000, 480_000, 0, &config, ResponsePath::Buffered,
+        );
+        assert_eq!(read, 150_000); // < 165000，cap 不变
+        assert_eq!(creation, 22_000); // cap 到上限
+        // 总值变了 → 5m/1h 必须同步，5m+1h == 总值
+        assert_eq!(c5m, 22_000);
+        assert_eq!(c1h, 0);
+        assert_eq!(c5m + c1h, creation);
+    }
+
+    #[test]
+    fn rewrite_with_split_keeps_5m_1h_when_total_unchanged() {
+        // cap 模式但总值未超上限 → 拆分保持原样。
+        let mut config = make_config("cap", true);
+        config.write_max = 100_000;
+        let (_read, creation, c5m, c1h) = rewrite_cache_usage_with_split(
+            0, 8000, 5000, 3000, &config, ResponsePath::NonStream,
+        );
+        assert_eq!(creation, 8000); // 8000 < 100000，不变
+        assert_eq!(c5m, 5000); // 原样保留
+        assert_eq!(c1h, 3000);
+    }
+
+    #[test]
+    fn disabled_is_identity_for_all_fields() {
+        // 关闭模拟缓存：四个字段必须原样返回，不被任何模式/上限影响。
+        let mut config = make_config("zero", false); // 即便 mode=zero，关闭时也不应清零
+        config.read_max = 1;
+        config.write_max = 1;
+        config.input_random_max = 99;
+        for path in [ResponsePath::Stream, ResponsePath::NonStream, ResponsePath::Buffered] {
+            let (r, c, m5, h1) =
+                rewrite_cache_usage_with_split(150_000, 480_000, 300_000, 180_000, &config, path);
+            assert_eq!((r, c, m5, h1), (150_000, 480_000, 300_000, 180_000),
+                "关闭时四字段必须原样返回");
+            assert_eq!(rewrite_input_tokens(&config, path), None,
+                "关闭时 input 不改写");
+        }
+    }
+
+    #[test]
+    fn passthrough_mode_is_identity_when_enabled() {
+        // 开启但 mode=passthrough：等同关闭，原样返回。
+        let config = make_config("passthrough", true);
+        let (r, c, m5, h1) = rewrite_cache_usage_with_split(
+            150_000, 480_000, 300_000, 180_000, &config, ResponsePath::Buffered,
+        );
+        assert_eq!((r, c, m5, h1), (150_000, 480_000, 300_000, 180_000));
+    }
+
+    /// 贴近正式环境的 weighted 配置（含读写分段权重）。
+    fn prod_weighted_config() -> CacheOptimizerConfig {
+        CacheOptimizerConfig {
+            enabled: true,
+            enabled_stream: true,
+            enabled_non_stream: true,
+            enabled_buffered: true,
+            mode: "weighted".to_string(),
+            read_min: 15_000,
+            read_max: 165_000,
+            write_min: 5,
+            write_max: 22_000,
+            weight_read_only: 12,
+            weight_write_only: 8,
+            weight_read_write: 90,
+            weight_none: 0,
+            rewrite_only_when_present: true,
+            use_segment_weights: true,
+            read_segments: vec![
+                CacheSegment { min: 15_000, max: 70_000, weight: 18 },
+                CacheSegment { min: 70_001, max: 110_000, weight: 52 },
+                CacheSegment { min: 110_001, max: 165_000, weight: 30 },
+            ],
+            write_segments: vec![
+                CacheSegment { min: 5, max: 800, weight: 72 },
+                CacheSegment { min: 801, max: 6500, weight: 24 },
+                CacheSegment { min: 6501, max: 22_000, weight: 4 },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn weighted_with_split_stays_in_range_and_syncs() {
+        // 上游有读有写（48万写 / 15万读），weighted 模式跑多次：
+        // 读/写要么 0、要么落在配置范围内；5m+1h 必须等于改写后的写总值。
+        let config = prod_weighted_config();
+        for _ in 0..1000 {
+            let (read, creation, c5m, c1h) = rewrite_cache_usage_with_split(
+                150_000, 480_000, 480_000, 0, &config, ResponsePath::Buffered,
+            );
+            // 写：要么 0（writeOnly 形态不会发生，因为上游有读有写 + readWrite 权重高，
+            // 但 readOnly 形态会让写=0），要么落在 [5, 22000]
+            assert!(
+                creation == 0 || (5..=22_000).contains(&creation),
+                "creation {creation} 超出 [5,22000]"
+            );
+            // 读：要么 0（writeOnly 形态），要么落在 [15000, 165000]
+            assert!(
+                read == 0 || (15_000..=165_000).contains(&read),
+                "read {read} 超出 [15000,165000]"
+            );
+            // 关键：改写后总写值绝不应是上游真实的 480000
+            assert_ne!(creation, 480_000, "写未被改写，仍是上游真实值");
+            // 5m/1h 同步：改写后(总值变了)5m+1h == creation
+            assert_eq!(c5m + c1h, creation, "5m+1h 必须等于写总值");
+        }
     }
 }

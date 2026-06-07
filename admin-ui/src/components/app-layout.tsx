@@ -2,7 +2,7 @@ import { ReactNode, useState } from 'react'
 import { Server, Moon, Sun, LogOut } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 
-type Page = 'credentials' | 'cache-optimizer' | 'model-mapping' | 'call-log'
+type Page = 'credentials' | 'cache-optimizer' | 'model-mapping' | 'call-log' | 'runtime-log'
 
 interface AppLayoutProps {
   currentPage: Page
@@ -29,6 +29,7 @@ export function AppLayout({ currentPage, onNavigate, onLogout, children }: AppLa
     { key: 'cache-optimizer', label: '模拟缓存' },
     { key: 'model-mapping', label: '模型映射' },
     { key: 'call-log', label: '调用日志' },
+    { key: 'runtime-log', label: '运行日志' },
   ]
 
   return (

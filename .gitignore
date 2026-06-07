@@ -23,4 +23,6 @@
 /stdout.log
 /stderr.log
 /.junnl.pid
+/logs/
+**/logs/
 

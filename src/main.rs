@@ -4,6 +4,8 @@ mod anthropic;
 mod common;
 mod http_client;
 mod kiro;
+mod log_buffer;
+mod logging;
 mod model;
 pub mod token;
 
@@ -23,13 +25,9 @@ async fn main() {
     // 解析命令行参数
     let args = Args::parse();
 
-    // 初始化日志
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // 初始化日志（控制台 + 按天滚动的 JSON 文件）。
+    // _log_guard 必须持有到 main 结束，否则非阻塞文件写线程会提前退出、丢日志。
+    let _log_guard = logging::init();
 
     // 加载配置
     let config_path = args

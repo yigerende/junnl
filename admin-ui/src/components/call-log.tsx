@@ -12,10 +12,10 @@ function formatTime(ms: number): string {
 }
 
 export function CallLog() {
-  const { data, isLoading, refetch } = useCallLogs(1000)
+  const { data, isLoading, refetch } = useCallLogs(5000)
   const { mutate: clearLogs, isPending: isClearing } = useClearCallLogs()
   const { mutate: saveCapacity, isPending: isSavingCap } = useSetCallLogCapacity()
-  const [capacityInput, setCapacityInput] = useState<number>(1000)
+  const [capacityInput, setCapacityInput] = useState<number>(5000)
 
   useEffect(() => {
     if (data?.capacity) setCapacityInput(data.capacity)
@@ -73,7 +73,7 @@ export function CallLog() {
             <Button size="sm" onClick={handleSaveCapacity} disabled={isSavingCap}>
               {isSavingCap ? '保存中...' : '保存'}
             </Button>
-            <span className="text-xs text-muted-foreground">超过上限自动丢弃最早的记录，默认 1000</span>
+            <span className="text-xs text-muted-foreground">超过上限自动丢弃最早的记录，默认 5000</span>
           </div>
         </CardContent>
       </Card>
