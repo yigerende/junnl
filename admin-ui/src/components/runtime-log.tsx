@@ -1,8 +1,12 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Trash2 } from 'lucide-react'
 import { storage } from '@/lib/storage'
+
+/** 虚拟滚动：固定行高（px），只渲染可视区 + 上下缓冲行 */
+const ROW_HEIGHT = 22
+const OVERSCAN = 10
 
 /** 单条运行日志（与后端 LogRecord 对齐） */
 interface LogRecord {
@@ -37,7 +41,6 @@ export function RuntimeLog() {
   const [levelFilter, setLevelFilter] = useState('all')
   const [autoScroll, setAutoScroll] = useState(true)
   const [connected, setConnected] = useState(false)
-  const bottomRef = useRef<HTMLDivElement>(null)
   const logsRef = useRef<LogRecord[]>([])
   const pendingRef = useRef<LogRecord[]>([])
   const flushTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -140,12 +143,7 @@ export function RuntimeLog() {
     }
   }, [append])
 
-  // 自动滚动到底部
-  useEffect(() => {
-    if (autoScroll) bottomRef.current?.scrollIntoView({ behavior: 'auto' })
-  }, [logs, autoScroll])
-
-  const matches = (log: LogRecord): boolean => {
+  const matches = useCallback((log: LogRecord): boolean => {
     if (levelFilter !== 'all' && log.level !== levelFilter) return false
     if (!search) return true
     const s = search.toLowerCase()
@@ -156,9 +154,51 @@ export function RuntimeLog() {
       if (k.toLowerCase().includes(s) || v.toLowerCase().includes(s)) return true
     }
     return false
-  }
+  }, [levelFilter, search])
 
-  const filtered = logs.filter(matches)
+  // 过滤结果用 useMemo 缓存，只在 logs/搜索/级别变化时重算
+  const filtered = useMemo(() => logs.filter(matches), [logs, matches])
+
+  // ---- 虚拟滚动：只渲染可视区 + 上下缓冲的行 ----
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const [scrollTop, setScrollTop] = useState(0)
+  const [viewportH, setViewportH] = useState(600)
+  const stickBottomRef = useRef(true) // 是否吸附在底部
+
+  // 监听容器尺寸
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const ro = new ResizeObserver(() => setViewportH(el.clientHeight))
+    ro.observe(el)
+    setViewportH(el.clientHeight)
+    return () => ro.disconnect()
+  }, [])
+
+  const onScroll = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+    setScrollTop(el.scrollTop)
+    // 距底部 <40px 视为吸附
+    stickBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+  }, [])
+
+  // 新日志到达 + 开启自动滚动 + 当前吸底 → 滚到底
+  useEffect(() => {
+    if (!autoScroll) return
+    const el = scrollRef.current
+    if (el && stickBottomRef.current) {
+      el.scrollTop = el.scrollHeight
+    }
+  }, [filtered.length, autoScroll])
+
+  const total = filtered.length
+  const startIdx = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN)
+  const visibleCount = Math.ceil(viewportH / ROW_HEIGHT) + OVERSCAN * 2
+  const endIdx = Math.min(total, startIdx + visibleCount)
+  const visibleRows = filtered.slice(startIdx, endIdx)
+  const padTop = startIdx * ROW_HEIGHT
+  const padBottom = (total - endIdx) * ROW_HEIGHT
 
   const renderFields = (log: LogRecord) => {
     const parts: string[] = []
@@ -229,20 +269,30 @@ export function RuntimeLog() {
           <div className="text-xs text-muted-foreground mb-2">
             显示 {filtered.length} / {logs.length} 条
           </div>
-          <div className="h-[calc(100vh-340px)] overflow-y-auto font-mono text-xs leading-relaxed bg-muted/30 rounded-md p-3">
-            {filtered.length === 0 ? (
+          <div
+            ref={scrollRef}
+            onScroll={onScroll}
+            className="h-[calc(100vh-340px)] overflow-y-auto font-mono text-xs bg-muted/30 rounded-md p-3"
+          >
+            {total === 0 ? (
               <p className="text-muted-foreground text-center py-6">暂无日志</p>
             ) : (
-              filtered.map(log => (
-                <div key={log.seq} className="whitespace-pre-wrap break-all border-b border-border/30 py-0.5">
-                  <span className="text-muted-foreground">{formatTime(log.ts)}</span>{' '}
-                  <span className={LEVEL_COLORS[log.level] ?? 'text-foreground'}>{log.level.padEnd(5)}</span>{' '}
-                  <span className="text-foreground">{log.message}</span>
-                  <span className="text-muted-foreground">{renderFields(log)}</span>
-                </div>
-              ))
+              <div style={{ paddingTop: padTop, paddingBottom: padBottom }}>
+                {visibleRows.map(log => (
+                  <div
+                    key={log.seq}
+                    className="flex items-center gap-1 overflow-hidden whitespace-nowrap"
+                    style={{ height: ROW_HEIGHT }}
+                    title={`${log.message}${renderFields(log)}`}
+                  >
+                    <span className="text-muted-foreground shrink-0">{formatTime(log.ts)}</span>
+                    <span className={`shrink-0 ${LEVEL_COLORS[log.level] ?? 'text-foreground'}`}>{log.level.padEnd(5)}</span>
+                    <span className="text-foreground truncate">{log.message}</span>
+                    <span className="text-muted-foreground truncate">{renderFields(log)}</span>
+                  </div>
+                ))}
+              </div>
             )}
-            <div ref={bottomRef} />
           </div>
         </CardContent>
       </Card>
