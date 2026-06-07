@@ -2,7 +2,9 @@
 
 use axum::{
     Json,
+    body::Body,
     extract::{Path, Query, State},
+    http::{StatusCode, header},
     response::IntoResponse,
     response::sse::{Event, KeepAlive, Sse},
 };
@@ -309,4 +311,87 @@ pub async fn stream_runtime_logs() -> Sse<impl Stream<Item = Result<Event, Infal
     });
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// GET /api/admin/logs/info
+/// 返回日志落盘信息：目录绝对路径、当天文件名、已有日志文件列表（含大小）。
+/// 用于前端展示「日志到底落在哪」，并辅助排查「正式机看不到日志文件」。
+pub async fn get_log_info() -> impl IntoResponse {
+    let dir = crate::logging::log_dir_absolute();
+    let today = crate::logging::today_log_filename();
+
+    // 枚举目录下合法的滚动日志文件（app.YYYY-MM-DD），附带字节大小。
+    let mut files: Vec<serde_json::Value> = Vec::new();
+    if let Ok(read_dir) = std::fs::read_dir(&dir) {
+        for entry in read_dir.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !crate::logging::is_valid_log_filename(&name) {
+                continue;
+            }
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            files.push(serde_json::json!({ "name": name, "size": size }));
+        }
+    }
+    // 按文件名（即日期）倒序，最新的在前。
+    files.sort_by(|a, b| {
+        b["name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(a["name"].as_str().unwrap_or(""))
+    });
+    let today_exists = files.iter().any(|f| f["name"].as_str() == Some(&today));
+
+    Json(serde_json::json!({
+        "dir": dir.to_string_lossy(),
+        "today": today,
+        "todayExists": today_exists,
+        "files": files,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct LogDownloadQuery {
+    /// 指定要下载的日志文件名（app.YYYY-MM-DD）；缺省下载当天。
+    pub file: Option<String>,
+}
+
+/// GET /api/admin/logs/download?file=app.YYYY-MM-DD
+/// 下载指定（默认当天）的落盘日志文件。文件名经严格校验，杜绝路径穿越。
+pub async fn download_log_file(Query(q): Query<LogDownloadQuery>) -> impl IntoResponse {
+    let name = q
+        .file
+        .unwrap_or_else(crate::logging::today_log_filename);
+
+    // 严格校验文件名：仅允许 app.YYYY-MM-DD，拒绝任何路径分隔符 / 穿越。
+    if !crate::logging::is_valid_log_filename(&name) {
+        return (StatusCode::BAD_REQUEST, "非法日志文件名").into_response();
+    }
+
+    let dir = crate::logging::log_dir_absolute();
+    let path = dir.join(&name);
+
+    let content = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("日志文件不存在：{name}（当天可能尚无日志产生）"),
+            )
+                .into_response();
+        }
+    };
+
+    // 落盘为 JSON-lines，下载时用 .log 后缀，附带 Content-Disposition 触发浏览器下载。
+    let download_name = format!("{name}.log");
+    (
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{download_name}\""),
+            ),
+        ],
+        Body::from(content),
+    )
+        .into_response()
 }

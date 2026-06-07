@@ -18,14 +18,59 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, fmt};
 
 /// 默认日志留存天数。
-const DEFAULT_RETAIN_DAYS: i64 = 14;
+const DEFAULT_RETAIN_DAYS: i64 = 7;
 
 /// 解析日志目录：优先 `JUNNL_LOG_DIR` 环境变量，否则用工作目录下的 `logs/`。
-fn log_dir() -> PathBuf {
+///
+/// 注意：默认 `logs/` 是**相对当前工作目录(cwd)**的相对路径，cwd 取决于进程
+/// 启动方式（脚本/systemd/docker），并非二进制所在目录。排查「找不到日志文件」
+/// 时优先用 [`log_dir_absolute`] 看真实落盘路径。
+pub fn log_dir() -> PathBuf {
     match std::env::var("JUNNL_LOG_DIR") {
         Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
         _ => PathBuf::from("logs"),
     }
+}
+
+/// 返回日志目录的绝对路径（供前端展示「日志到底落在哪」）。
+///
+/// 若目录已存在则用 `canonicalize` 解析真实路径；否则回退为 `cwd + 相对路径`，
+/// 保证即使目录尚未创建也能给出一个可读的绝对路径。
+///
+/// Windows 上 `canonicalize` 会返回 `\\?\` 扩展长度前缀，这里去掉，让展示更友好。
+pub fn log_dir_absolute() -> PathBuf {
+    let resolved = std::fs::canonicalize(log_dir()).unwrap_or_else(|_| {
+        let dir = log_dir();
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&dir))
+            .unwrap_or(dir)
+    });
+    strip_unc_prefix(resolved)
+}
+
+/// 去掉 Windows `canonicalize` 产生的 `\\?\` 扩展长度前缀（非 Windows 原样返回）。
+fn strip_unc_prefix(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path
+    }
+}
+
+/// 校验日志文件名是否为合法的滚动日志文件名（`app.YYYY-MM-DD`）。
+///
+/// 仅允许 `app.` 前缀 + 合法日期，杜绝 `..`、路径分隔符等穿越攻击。
+pub fn is_valid_log_filename(name: &str) -> bool {
+    let Some(date_part) = name.strip_prefix("app.") else {
+        return false;
+    };
+    chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d").is_ok()
+}
+
+/// 当天（UTC）滚动日志文件名，与 `rolling::daily` 的命名一致。
+pub fn today_log_filename() -> String {
+    format!("app.{}", chrono::Utc::now().date_naive())
 }
 
 /// 解析留存天数：`JUNNL_LOG_RETAIN_DAYS`，非法值回退默认。
@@ -141,4 +186,35 @@ fn spawn_cleanup_task(dir: PathBuf, retain: i64) {
             cleanup_once(&dir, retain);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_log_filenames_accepted() {
+        assert!(is_valid_log_filename("app.2026-06-07"));
+        assert!(is_valid_log_filename("app.2025-01-01"));
+    }
+
+    #[test]
+    fn invalid_log_filenames_rejected() {
+        // 缺前缀 / 非法日期 / 路径穿越 / 分隔符一律拒绝。
+        assert!(!is_valid_log_filename("app.txt"));
+        assert!(!is_valid_log_filename("app."));
+        assert!(!is_valid_log_filename("2026-06-07"));
+        assert!(!is_valid_log_filename("app.2026-13-99"));
+        assert!(!is_valid_log_filename("app.../../etc/passwd"));
+        assert!(!is_valid_log_filename("app.2026-06-07/../secret"));
+        assert!(!is_valid_log_filename("../app.2026-06-07"));
+        assert!(!is_valid_log_filename(""));
+    }
+
+    #[test]
+    fn today_filename_matches_rolling_format() {
+        let name = today_log_filename();
+        assert!(name.starts_with("app."));
+        assert!(is_valid_log_filename(&name));
+    }
 }

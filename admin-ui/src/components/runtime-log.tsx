@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
-import { Trash2 } from 'lucide-react'
+import { Trash2, Download } from 'lucide-react'
 import { storage } from '@/lib/storage'
 
 /** 虚拟滚动：固定行高（px），只渲染可视区 + 上下缓冲行 */
@@ -41,6 +41,8 @@ export function RuntimeLog() {
   const [levelFilter, setLevelFilter] = useState('all')
   const [autoScroll, setAutoScroll] = useState(true)
   const [connected, setConnected] = useState(false)
+  const [logDir, setLogDir] = useState('')
+  const [downloading, setDownloading] = useState(false)
   const logsRef = useRef<LogRecord[]>([])
   const pendingRef = useRef<LogRecord[]>([])
   const flushTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -143,6 +145,50 @@ export function RuntimeLog() {
     }
   }, [append])
 
+  // 拉取日志落盘信息（目录绝对路径），让用户知道日志文件到底落在哪
+  useEffect(() => {
+    const apiKey = storage.getApiKey()
+    fetch('/api/admin/logs/info', {
+      headers: apiKey ? { 'x-api-key': apiKey } : {},
+    })
+      .then(r => (r.ok ? r.json() : null))
+      .then(data => { if (data?.dir) setLogDir(data.dir as string) })
+      .catch(() => { /* 信息获取失败不致命 */ })
+  }, [])
+
+  // 一键导出当天落盘日志文件（带 x-api-key，故用 fetch -> blob 触发下载）
+  const exportToday = useCallback(async () => {
+    if (downloading) return
+    setDownloading(true)
+    try {
+      const apiKey = storage.getApiKey()
+      const resp = await fetch('/api/admin/logs/download', {
+        headers: apiKey ? { 'x-api-key': apiKey } : {},
+      })
+      if (!resp.ok) {
+        const msg = await resp.text().catch(() => '')
+        alert(`导出失败：${resp.status} ${msg}`)
+        return
+      }
+      const blob = await resp.blob()
+      const today = new Date()
+      const p = (n: number) => String(n).padStart(2, '0')
+      const fname = `junnl-${today.getFullYear()}-${p(today.getMonth() + 1)}-${p(today.getDate())}.log`
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = fname
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      alert(`导出失败：${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setDownloading(false)
+    }
+  }, [downloading])
+
   const matches = useCallback((log: LogRecord): boolean => {
     if (levelFilter !== 'all' && log.level !== levelFilter) return false
     if (!search) return true
@@ -218,11 +264,25 @@ export function RuntimeLog() {
           <p className="text-sm text-muted-foreground">
             通过 SSE 实时接收服务端日志（内存保留最近 {MAX_ROWS} 条，重启清空）
           </p>
+          {logDir && (
+            <p className="text-xs text-muted-foreground mt-1">
+              落盘目录：<span className="font-mono">{logDir}</span>（按天滚动，留存 7 天）
+            </p>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <span className={`text-xs ${connected ? 'text-emerald-500' : 'text-muted-foreground'}`}>
             {connected ? '● 实时' : '○ 未连接'}
           </span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={exportToday}
+            disabled={downloading}
+          >
+            <Download className="h-4 w-4 mr-1" />
+            {downloading ? '导出中...' : '导出当天'}
+          </Button>
           <Button
             variant="outline"
             size="sm"
