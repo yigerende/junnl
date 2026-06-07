@@ -76,10 +76,24 @@ export async function forceRefreshToken(
   return data
 }
 
-// 获取凭据余额
-export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
-  const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+// 获取凭据余额。fresh=true 时强制跳过缓存拉上游最新（单独测活）。
+export async function getCredentialBalance(id: number, fresh = false): Promise<BalanceResponse> {
+  const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`, {
+    params: fresh ? { fresh: true } : undefined,
+  })
   return data
+}
+
+// 设置凭据超额开关（调上游 setUserPreference），返回最新余额
+export async function setCredentialOverage(id: number, enabled: boolean): Promise<BalanceResponse> {
+  const { data } = await api.post<BalanceResponse>(`/credentials/${id}/overage`, { enabled })
+  return data
+}
+
+// 获取所有缓存的余额（只读，进页面立即展示，可能不是最新）
+export async function getCachedBalances(): Promise<BalanceResponse[]> {
+  const { data } = await api.get<{ balances: BalanceResponse[] }>('/balances/cached')
+  return data.balances
 }
 
 // 添加新凭据

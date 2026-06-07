@@ -39,6 +39,12 @@ export interface BalanceResponse {
   remaining: number
   usagePercentage: number
   nextResetAt: number | null
+  overageStatus: string
+  overageCapability: string | null
+  baseLimit: number
+  overageCap: number
+  totalLimit: number
+  overageUsage: number
 }
 
 // 成功响应

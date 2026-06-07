@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, AlertTriangle, Ban, Activity, Globe } from 'lucide-react'
+import { RefreshCw, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, AlertTriangle, Ban, Activity, Globe, Wallet, DollarSign } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -12,7 +12,7 @@ import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
-import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
+import { getCredentialBalance, forceRefreshToken, getCachedBalances } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
@@ -52,10 +52,38 @@ export function Dashboard({}: DashboardProps) {
   const endIndex = startIndex + itemsPerPage
   const currentCredentials = data?.credentials.slice(startIndex, endIndex) || []
   const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
+
+  // 余额合计（基于已查询到余额的凭据，可能不含未查询的）
+  const balanceList = Array.from(balanceMap.values())
+  const totalLimitSum = balanceList.reduce((sum, b) => sum + (b.totalLimit || 0), 0)
+  const totalUsedSum = balanceList.reduce((sum, b) => sum + (b.currentUsage || 0), 0)
+  const balanceKnownCount = balanceList.length
   const selectedDisabledCount = Array.from(selectedIds).filter(id => {
     const credential = data?.credentials.find(c => c.id === id)
     return Boolean(credential?.disabled)
   }).length
+
+  // 进页面时加载缓存余额（只读，可能不是最新），让卡片立即有额度可显示。
+  // 用户点「查询信息」或「查看余额」才拉取最新。
+  useEffect(() => {
+    let cancelled = false
+    getCachedBalances()
+      .then((list) => {
+        if (cancelled || list.length === 0) return
+        setBalanceMap((prev) => {
+          const next = new Map(prev)
+          for (const b of list) {
+            // 不覆盖已有的（已有的可能是刚拉的最新值）
+            if (!next.has(b.id)) next.set(b.id, b)
+          }
+          return next
+        })
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   // 当凭据列表变化时重置到第一页
   useEffect(() => {
@@ -119,6 +147,21 @@ export function Dashboard({}: DashboardProps) {
 
   const deselectAll = () => {
     setSelectedIds(new Set())
+  }
+
+  // 全选/取消全选当前页凭据
+  const toggleSelectAllCurrentPage = () => {
+    const pageIds = currentCredentials.map(c => c.id)
+    const allSelected = pageIds.length > 0 && pageIds.every(id => selectedIds.has(id))
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (allSelected) {
+        pageIds.forEach(id => next.delete(id))
+      } else {
+        pageIds.forEach(id => next.add(id))
+      }
+      return next
+    })
   }
 
   // 批量删除（仅删除已禁用项）
@@ -423,8 +466,15 @@ export function Dashboard({}: DashboardProps) {
       })
 
       try {
-        const balance = await getCredentialBalance(id)
+        // 批量验活强制跳缓存拉上游（与单独测活一致），验的是真实存活状态
+        const balance = await getCredentialBalance(id, true)
         successCount++
+        // 同步更新卡片余额
+        setBalanceMap(prev => {
+          const next = new Map(prev)
+          next.set(id, balance)
+          return next
+        })
 
         // 更新为成功状态
         setVerifyResults(prev => {
@@ -536,7 +586,7 @@ export function Dashboard({}: DashboardProps) {
       </div>
 
       {/* 统计卡片 */}
-      <div className="grid gap-4 grid-cols-2 md:grid-cols-4 mb-6">
+      <div className="grid gap-4 grid-cols-2 md:grid-cols-5 mb-6">
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground flex items-center gap-1.5">
@@ -636,6 +686,38 @@ export function Dashboard({}: DashboardProps) {
               </div>
             </CardContent>
           </Card>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground flex items-center gap-1.5">
+                <Wallet className="h-3.5 w-3.5 text-emerald-600" />
+                总余额
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="text-2xl font-bold text-emerald-600">
+                {totalLimitSum.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+              </div>
+              <div className="text-xs text-muted-foreground mt-1">
+                {balanceKnownCount} 个凭据合计
+              </div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground flex items-center gap-1.5">
+                <DollarSign className="h-3.5 w-3.5 text-rose-500" />
+                已使用余额
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="text-2xl font-bold text-rose-500">
+                {totalUsedSum.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+              </div>
+              <div className="text-xs text-muted-foreground mt-1">
+                {totalLimitSum > 0 ? ((totalUsedSum / totalLimitSum) * 100).toFixed(1) : '0'}% 已用
+              </div>
+            </CardContent>
+          </Card>
         </div>
 
         {/* 凭据列表 */}
@@ -643,6 +725,11 @@ export function Dashboard({}: DashboardProps) {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-4">
               <h2 className="text-xl font-semibold">凭据管理</h2>
+              <Button onClick={toggleSelectAllCurrentPage} size="sm" variant="outline">
+                {currentCredentials.length > 0 && currentCredentials.every(c => selectedIds.has(c.id))
+                  ? '取消全选'
+                  : '全选本页'}
+              </Button>
               {selectedIds.size > 0 && (
                 <div className="flex items-center gap-2">
                   <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
@@ -746,6 +833,13 @@ export function Dashboard({}: DashboardProps) {
                     onToggleSelect={() => toggleSelect(credential.id)}
                     balance={balanceMap.get(credential.id) || null}
                     loadingBalance={loadingBalanceIds.has(credential.id)}
+                    onBalanceUpdate={(b) =>
+                      setBalanceMap((prev) => {
+                        const next = new Map(prev)
+                        next.set(b.id, b)
+                        return next
+                      })
+                    }
                   />
                 ))}
               </div>

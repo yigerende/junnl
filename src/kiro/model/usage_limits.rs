@@ -19,6 +19,23 @@ pub struct UsageLimitsResponse {
     /// 使用量明细列表
     #[serde(default)]
     pub usage_breakdown_list: Vec<UsageBreakdown>,
+
+    /// 超额配置（账号级别的超额计费开关状态）
+    #[serde(default)]
+    pub overage_configuration: Option<OverageConfiguration>,
+}
+
+/// 超额配置
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverageConfiguration {
+    /// 超额状态：ENABLED / DISABLED
+    #[serde(default)]
+    pub overage_status: Option<String>,
+
+    /// 超额能力：账号是否有资格开启超额
+    #[serde(default)]
+    pub overage_capability: Option<String>,
 }
 
 /// 订阅信息
@@ -62,6 +79,14 @@ pub struct UsageBreakdown {
     /// 使用限额（精确值）
     #[serde(default)]
     pub usage_limit_with_precision: f64,
+
+    /// 超额上限（基础额度之外可继续使用的额度）
+    #[serde(default)]
+    pub overage_cap: i64,
+
+    /// 超额上限（精确值）
+    #[serde(default)]
+    pub overage_cap_with_precision: f64,
 }
 
 /// 奖励额度
@@ -198,5 +223,161 @@ impl UsageLimitsResponse {
         }
 
         total
+    }
+
+    /// 超额状态：ENABLED / DISABLED / UNKNOWN（上游未返回时）
+    pub fn overage_status(&self) -> &str {
+        self.overage_configuration
+            .as_ref()
+            .and_then(|c| c.overage_status.as_deref())
+            .unwrap_or("UNKNOWN")
+    }
+
+    /// 是否已开启超额
+    pub fn overage_enabled(&self) -> bool {
+        self.overage_status() == "ENABLED"
+    }
+
+    /// 超额能力（账号是否有资格开启超额）
+    pub fn overage_capability(&self) -> Option<&str> {
+        self.overage_configuration
+            .as_ref()
+            .and_then(|c| c.overage_capability.as_deref())
+    }
+
+    /// 基础额度（精确值，不含超额/试用/奖励）
+    pub fn base_limit(&self) -> f64 {
+        self.primary_breakdown()
+            .map(|b| b.usage_limit_with_precision)
+            .unwrap_or(0.0)
+    }
+
+    /// 超额上限（精确值）
+    pub fn overage_cap(&self) -> f64 {
+        self.primary_breakdown()
+            .map(|b| {
+                if b.overage_cap_with_precision > 0.0 {
+                    b.overage_cap_with_precision
+                } else {
+                    b.overage_cap as f64
+                }
+            })
+            .unwrap_or(0.0)
+    }
+
+    /// 基础当前使用量（精确值，不含试用/奖励）
+    pub fn base_usage(&self) -> f64 {
+        self.primary_breakdown()
+            .map(|b| b.current_usage_with_precision)
+            .unwrap_or(0.0)
+    }
+
+    /// 总额度 = 基础额度 + 超额上限（仅在超额开启时计入超额）
+    pub fn total_limit_with_overage(&self) -> f64 {
+        if self.overage_enabled() {
+            self.base_limit() + self.overage_cap()
+        } else {
+            self.base_limit()
+        }
+    }
+
+    /// 已用超额 = max(0, 基础使用量 - 基础额度)，上限为超额上限
+    pub fn overage_usage(&self) -> f64 {
+        let over = (self.base_usage() - self.base_limit()).max(0.0);
+        let cap = self.overage_cap();
+        if cap > 0.0 { over.min(cap) } else { over }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 贴近截图：基础 1000 + 超额 10000，已用 14.42，超额开启。
+    fn parse(json: &str) -> UsageLimitsResponse {
+        serde_json::from_str(json).expect("parse usage limits")
+    }
+
+    #[test]
+    fn parses_overage_enabled_and_computes_totals() {
+        let r = parse(
+            r#"{
+                "overageConfiguration": { "overageStatus": "ENABLED", "overageCapability": "CAPABLE" },
+                "usageBreakdownList": [{
+                    "currentUsage": 14,
+                    "currentUsageWithPrecision": 14.42,
+                    "usageLimit": 1000,
+                    "usageLimitWithPrecision": 1000.0,
+                    "overageCap": 10000,
+                    "overageCapWithPrecision": 10000.0
+                }]
+            }"#,
+        );
+        assert_eq!(r.overage_status(), "ENABLED");
+        assert!(r.overage_enabled());
+        assert_eq!(r.overage_capability(), Some("CAPABLE"));
+        assert_eq!(r.base_limit(), 1000.0);
+        assert_eq!(r.overage_cap(), 10000.0);
+        // 总额度 = 基础 + 超额 = 11000
+        assert_eq!(r.total_limit_with_overage(), 11000.0);
+        // 已用 14.42 < 基础 1000，超额用量为 0
+        assert_eq!(r.overage_usage(), 0.0);
+    }
+
+    #[test]
+    fn overage_usage_counts_beyond_base() {
+        let r = parse(
+            r#"{
+                "overageConfiguration": { "overageStatus": "ENABLED" },
+                "usageBreakdownList": [{
+                    "currentUsageWithPrecision": 1250.0,
+                    "usageLimitWithPrecision": 1000.0,
+                    "overageCapWithPrecision": 10000.0
+                }]
+            }"#,
+        );
+        // 超基础 250
+        assert_eq!(r.overage_usage(), 250.0);
+    }
+
+    #[test]
+    fn overage_usage_capped_at_overage_cap() {
+        let r = parse(
+            r#"{
+                "overageConfiguration": { "overageStatus": "ENABLED" },
+                "usageBreakdownList": [{
+                    "currentUsageWithPrecision": 99999.0,
+                    "usageLimitWithPrecision": 1000.0,
+                    "overageCapWithPrecision": 10000.0
+                }]
+            }"#,
+        );
+        // 超出部分 98999，但上限是 10000
+        assert_eq!(r.overage_usage(), 10000.0);
+    }
+
+    #[test]
+    fn overage_disabled_excludes_overage_from_total() {
+        let r = parse(
+            r#"{
+                "overageConfiguration": { "overageStatus": "DISABLED" },
+                "usageBreakdownList": [{
+                    "usageLimitWithPrecision": 1000.0,
+                    "overageCapWithPrecision": 10000.0
+                }]
+            }"#,
+        );
+        assert!(!r.overage_enabled());
+        // 关闭时总额度 = 基础，不含超额
+        assert_eq!(r.total_limit_with_overage(), 1000.0);
+    }
+
+    #[test]
+    fn missing_overage_config_is_unknown() {
+        let r = parse(r#"{ "usageBreakdownList": [{ "usageLimitWithPrecision": 500.0 }] }"#);
+        assert_eq!(r.overage_status(), "UNKNOWN");
+        assert!(!r.overage_enabled());
+        assert_eq!(r.overage_cap(), 0.0);
+        assert_eq!(r.total_limit_with_overage(), 500.0);
     }
 }

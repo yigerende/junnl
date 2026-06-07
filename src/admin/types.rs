@@ -181,6 +181,18 @@ pub struct BalanceResponse {
     pub usage_percentage: f64,
     /// 下次重置时间（Unix 时间戳）
     pub next_reset_at: Option<f64>,
+    /// 超额状态：ENABLED / DISABLED / UNKNOWN
+    pub overage_status: String,
+    /// 超额能力（账号是否有资格开启超额）
+    pub overage_capability: Option<String>,
+    /// 基础额度（不含超额）
+    pub base_limit: f64,
+    /// 超额上限
+    pub overage_cap: f64,
+    /// 总额度 = 基础 + 超额（开启时计入超额）
+    pub total_limit: f64,
+    /// 已用超额
+    pub overage_usage: f64,
 }
 
 // ============ 负载均衡配置 ============

@@ -74,13 +74,54 @@ pub async fn reset_failure_count(
     }
 }
 
+/// 余额查询参数
+#[derive(serde::Deserialize)]
+pub struct BalanceQuery {
+    /// fresh=true 时跳过缓存强制拉上游（用于单独测活）
+    #[serde(default)]
+    pub fresh: bool,
+}
+
 /// GET /api/admin/credentials/:id/balance
-/// 获取指定凭据的余额
+/// 获取指定凭据的余额。?fresh=true 强制跳过缓存（单独测活）。
 pub async fn get_credential_balance(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
+    Query(q): Query<BalanceQuery>,
 ) -> impl IntoResponse {
-    match state.service.get_balance(id).await {
+    let result = if q.fresh {
+        state.service.get_balance_fresh(id).await
+    } else {
+        state.service.get_balance(id).await
+    };
+    match result {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/balances/cached
+/// 返回所有缓存的余额（只读，不请求上游），供前端进页面立即展示。
+pub async fn get_cached_balances(State(state): State<AdminState>) -> impl IntoResponse {
+    let balances = state.service.get_cached_balances();
+    Json(serde_json::json!({ "balances": balances }))
+}
+
+/// 设置超额开关请求体
+#[derive(serde::Deserialize)]
+pub struct SetOverageRequest {
+    pub enabled: bool,
+}
+
+/// POST /api/admin/credentials/:id/overage
+/// 开启/关闭该凭据对应账号的超额计费（调上游 setUserPreference）。
+/// 成功返回该凭据最新余额（含改写后的超额状态）。
+pub async fn set_credential_overage(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetOverageRequest>,
+) -> impl IntoResponse {
+    match state.service.set_overage(id, payload.enabled).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

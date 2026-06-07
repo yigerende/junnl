@@ -200,6 +200,23 @@ impl AdminService {
         Ok(balance)
     }
 
+    /// 强制从上游获取余额（跳过缓存），用于「单独测活」。成功即写回缓存。
+    pub async fn get_balance_fresh(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
+        let balance = self.fetch_balance(id).await?;
+        {
+            let mut cache = self.balance_cache.lock();
+            cache.insert(
+                id,
+                CachedBalance {
+                    cached_at: Utc::now().timestamp() as f64,
+                    data: balance.clone(),
+                },
+            );
+        }
+        self.save_balance_cache();
+        Ok(balance)
+    }
+
     /// 从上游获取余额（无缓存）
     async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
         let usage = self
@@ -207,7 +224,14 @@ impl AdminService {
             .get_usage_limits_for(id)
             .await
             .map_err(|e| self.classify_balance_error(e, id))?;
+        Ok(Self::build_balance_response(id, &usage))
+    }
 
+    /// 从上游额度信息构建余额响应（含超额字段）。
+    fn build_balance_response(
+        id: u64,
+        usage: &crate::kiro::model::usage_limits::UsageLimitsResponse,
+    ) -> BalanceResponse {
         let current_usage = usage.current_usage();
         let usage_limit = usage.usage_limit();
         let remaining = (usage_limit - current_usage).max(0.0);
@@ -217,7 +241,7 @@ impl AdminService {
             0.0
         };
 
-        Ok(BalanceResponse {
+        BalanceResponse {
             id,
             subscription_title: usage.subscription_title().map(|s| s.to_string()),
             current_usage,
@@ -225,7 +249,65 @@ impl AdminService {
             remaining,
             usage_percentage,
             next_reset_at: usage.next_date_reset,
-        })
+            overage_status: usage.overage_status().to_string(),
+            overage_capability: usage.overage_capability().map(|s| s.to_string()),
+            base_limit: usage.base_limit(),
+            overage_cap: usage.overage_cap(),
+            total_limit: usage.total_limit_with_overage(),
+            overage_usage: usage.overage_usage(),
+        }
+    }
+
+    /// 返回所有内存缓存中的余额（只读，不请求上游）。
+    /// 供前端进页面时立即展示「上次查询到的余额」，可能不是最新。
+    pub fn get_cached_balances(&self) -> Vec<BalanceResponse> {
+        let cache = self.balance_cache.lock();
+        cache.values().map(|c| c.data.clone()).collect()
+    }
+
+    /// 设置超额开关（Admin API）。成功后清缓存并返回最新余额。
+    pub async fn set_overage(
+        &self,
+        id: u64,
+        enabled: bool,
+    ) -> Result<BalanceResponse, AdminServiceError> {
+        let usage = self
+            .token_manager
+            .set_overage_for(id, enabled)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))?;
+
+        let mut balance = Self::build_balance_response(id, &usage);
+
+        // 乐观更新：上游 setUserPreference 成功后，getUsageLimits 可能因最终一致性
+        // 延迟仍返回旧的 overageStatus。这里以本次操作的目标值为准覆盖，
+        // 并据此重算总额度（开启=基础+超额，关闭=基础），保证前端立即正确。
+        // 下次用户主动刷新余额时，上游已反映，数据自然一致。
+        balance.overage_status = if enabled { "ENABLED".to_string() } else { "DISABLED".to_string() };
+        balance.total_limit = if enabled {
+            balance.base_limit + balance.overage_cap
+        } else {
+            balance.base_limit
+        };
+        if !enabled {
+            // 关闭后不再展示已用超额
+            balance.overage_usage = 0.0;
+        }
+
+        // 状态已变，刷新缓存。
+        {
+            let mut cache = self.balance_cache.lock();
+            cache.insert(
+                id,
+                CachedBalance {
+                    cached_at: Utc::now().timestamp() as f64,
+                    data: balance.clone(),
+                },
+            );
+        }
+        self.save_balance_cache();
+
+        Ok(balance)
     }
 
     /// 添加新凭据
@@ -522,16 +604,12 @@ impl AdminService {
             }
         };
 
-        let now = Utc::now().timestamp() as f64;
+        // 加载时不按 TTL 过滤：进页面要能展示「上次查询到的余额」（哪怕已过期）。
+        // TTL 仅用于 get_balance 决定是否重新请求上游（见 get_balance）。
         map.into_iter()
             .filter_map(|(k, v)| {
                 let id = k.parse::<u64>().ok()?;
-                // 丢弃超过 TTL 的条目
-                if (now - v.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    Some((id, v))
-                } else {
-                    None
-                }
+                Some((id, v))
             })
             .collect()
     }

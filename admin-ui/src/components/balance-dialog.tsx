@@ -1,3 +1,5 @@
+import { useState } from 'react'
+import { toast } from 'sonner'
 import {
   Dialog,
   DialogContent,
@@ -5,7 +7,8 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Progress } from '@/components/ui/progress'
-import { useCredentialBalance } from '@/hooks/use-credentials'
+import { Button } from '@/components/ui/button'
+import { useCredentialBalance, useSetOverage } from '@/hooks/use-credentials'
 import { parseError } from '@/lib/utils'
 
 interface BalanceDialogProps {
@@ -16,6 +19,20 @@ interface BalanceDialogProps {
 
 export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialogProps) {
   const { data: balance, isLoading, error } = useCredentialBalance(credentialId)
+  const { mutate: setOverage, isPending: isTogglingOverage } = useSetOverage()
+  const [confirming, setConfirming] = useState(false)
+
+  const handleToggleOverage = (enable: boolean) => {
+    if (credentialId == null) return
+    setConfirming(false)
+    setOverage(
+      { id: credentialId, enabled: enable },
+      {
+        onSuccess: () => toast.success(enable ? '已开启超额' : '已关闭超额'),
+        onError: (err) => toast.error(`设置失败：${parseError(err).title}`),
+      },
+    )
+  }
 
   const formatDate = (timestamp: number | null) => {
     if (!timestamp) return '未知'
@@ -95,6 +112,75 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
                   {formatDate(balance.nextResetAt)}
                 </span>
               </div>
+            </div>
+
+            {/* 超额（Overages）*/}
+            <div className="pt-4 border-t space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-muted-foreground">Overages</span>
+                <span
+                  className={`text-sm font-medium ${
+                    balance.overageStatus === 'ENABLED'
+                      ? 'text-purple-600'
+                      : 'text-muted-foreground'
+                  }`}
+                >
+                  {balance.overageStatus === 'ENABLED'
+                    ? 'Enabled'
+                    : balance.overageStatus === 'DISABLED'
+                      ? 'Disabled'
+                      : '未知'}
+                </span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span className="text-muted-foreground">总额度</span>
+                <span className="font-medium">
+                  基础 {formatNumber(balance.baseLimit)} + 超额 {formatNumber(balance.overageCap)}
+                  {' '}= {formatNumber(balance.totalLimit)}
+                </span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span className="text-muted-foreground">超额用量</span>
+                <span className="font-medium">
+                  {formatNumber(balance.overageUsage)} / {formatNumber(balance.overageCap)}
+                </span>
+              </div>
+
+              {/* 开关：调上游真实计费设置，二次确认 */}
+              {balance.overageStatus !== 'UNKNOWN' && (
+                confirming ? (
+                  <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm space-y-2">
+                    <p className="text-amber-700">
+                      {balance.overageStatus === 'ENABLED'
+                        ? '确认关闭超额？关闭后该账号超过基础额度将停止服务。'
+                        : '确认开启超额？开启后该账号超过基础额度会继续计费（产生真实费用）。'}
+                    </p>
+                    <div className="flex gap-2">
+                      <Button
+                        size="sm"
+                        variant="destructive"
+                        disabled={isTogglingOverage}
+                        onClick={() => handleToggleOverage(balance.overageStatus !== 'ENABLED')}
+                      >
+                        {isTogglingOverage ? '处理中…' : '确认'}
+                      </Button>
+                      <Button size="sm" variant="outline" onClick={() => setConfirming(false)}>
+                        取消
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="w-full mt-1"
+                    disabled={isTogglingOverage}
+                    onClick={() => setConfirming(true)}
+                  >
+                    {balance.overageStatus === 'ENABLED' ? '关闭 Overages' : '开启 Overages'}
+                  </Button>
+                )
+              )}
             </div>
           </div>
         )}

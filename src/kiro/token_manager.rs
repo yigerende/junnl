@@ -392,6 +392,77 @@ pub(crate) async fn get_usage_limits(
     Ok(data)
 }
 
+/// 设置用户偏好（超额开关）。
+///
+/// 调用上游 `setUserPreference` 接口，改写该 AWS 账号的超额计费开关。
+/// `overage_status` 取 "ENABLED" 或 "DISABLED"。
+///
+/// 复用与 `get_usage_limits` 完全一致的 host / 认证头 / profileArn 处理，
+/// 保证操作的是同一个账号。注意：这是改账号真实计费设置的写操作。
+pub(crate) async fn set_user_preference(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+    overage_status: &str,
+) -> anyhow::Result<()> {
+    let region = credentials.effective_api_region(config);
+    let host = format!("q.{}.amazonaws.com", region);
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let kiro_version = &config.kiro_version;
+    let os_name = &config.system_version;
+    let node_version = &config.node_version;
+
+    let url = format!("https://{}/setUserPreference", host);
+
+    let mut body = serde_json::json!({
+        "overageConfiguration": { "overageStatus": overage_status },
+    });
+    if let Some(profile_arn) = credentials.resolved_profile_arn() {
+        body["profileArn"] = serde_json::json!(profile_arn);
+    }
+
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        os_name, node_version, kiro_version, machine_id
+    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+
+    let mut request = client
+        .post(&url)
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("content-type", "application/json")
+        .header("Connection", "close")
+        .json(&body);
+
+    if credentials.is_api_key_credential() {
+        request = request.header("tokentype", "API_KEY");
+    }
+
+    let response = request.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        let error_msg = match status.as_u16() {
+            401 => "认证失败，Token 无效或已过期",
+            403 => "权限不足，无法修改超额设置",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "服务器错误，AWS 服务暂时不可用",
+            _ => "设置超额开关失败",
+        };
+        bail!("{}: {} {}", error_msg, status, body_text);
+    }
+
+    Ok(())
+}
+
 // ============================================================================
 // 多凭据 Token 管理器
 // ============================================================================
@@ -1757,6 +1828,62 @@ impl MultiTokenManager {
             }
         }
 
+        Ok(usage_limits)
+    }
+
+    /// 设置指定凭据的超额开关（Admin API）。
+    ///
+    /// `enabled=true` → ENABLED，`false` → DISABLED。
+    /// 先通过 `get_usage_limits_for` 确保 token 新鲜（它会按需刷新并持久化），
+    /// 再用当前有效 token 调用上游 `setUserPreference`。
+    /// 成功后返回该凭据最新的额度信息（含改写后的超额状态）。
+    pub async fn set_overage_for(
+        &self,
+        id: u64,
+        enabled: bool,
+    ) -> anyhow::Result<UsageLimitsResponse> {
+        let overage_status = if enabled { "ENABLED" } else { "DISABLED" };
+
+        // 先拉一次额度，顺带保证 token 已刷新且有效。
+        let _ = self.get_usage_limits_for(id).await?;
+
+        // 取当前（已刷新的）凭据与有效 token。
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        let token = if credentials.is_api_key_credential() {
+            credentials
+                .kiro_api_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
+        } else {
+            credentials
+                .access_token
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
+        };
+
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        set_user_preference(
+            &credentials,
+            &self.config,
+            &token,
+            effective_proxy.as_ref(),
+            overage_status,
+        )
+        .await?;
+
+        tracing::info!("凭据 #{} 超额开关已设置为 {}", id, overage_status);
+
+        // 重新拉取一次，返回上游确认后的最新状态。
+        let usage_limits =
+            get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
         Ok(usage_limits)
     }
 

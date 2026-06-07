@@ -6,6 +6,7 @@ import {
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
+  setCredentialOverage,
   addCredential,
   deleteCredential,
   getLoadBalancingMode,
@@ -29,6 +30,20 @@ export function useCredentialBalance(id: number | null) {
     queryFn: () => getCredentialBalance(id!),
     enabled: id !== null,
     retry: false, // 余额查询失败时不重试（避免重复请求被封禁的账号）
+  })
+}
+
+// 设置超额开关（调上游），成功后写回余额缓存
+export function useSetOverage() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
+      setCredentialOverage(id, enabled),
+    onSuccess: (balance) => {
+      // 用返回的最新余额直接更新缓存，立即反映新的超额状态
+      queryClient.setQueryData(['credential-balance', balance.id], balance)
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
   })
 }
 
