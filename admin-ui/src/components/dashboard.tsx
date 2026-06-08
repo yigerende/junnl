@@ -4,6 +4,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
@@ -14,6 +15,7 @@ import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useBatchSetConcurrency } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken, getCachedBalances } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import { storage } from '@/lib/storage'
 import type { BalanceResponse } from '@/types/api'
 
 interface DashboardProps {}
@@ -38,9 +40,11 @@ export function Dashboard({}: DashboardProps) {
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
+  // 凭据列表自动刷新间隔（秒），默认 3s，持久化到 localStorage；0 = 关闭自动刷新
+  const [refreshSeconds, setRefreshSeconds] = useState<number>(() => storage.getRefreshSeconds())
 
   const queryClient = useQueryClient()
-  const { data, isLoading, error, refetch } = useCredentials()
+  const { data, isLoading, error, refetch } = useCredentials(refreshSeconds)
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
@@ -163,6 +167,14 @@ export function Dashboard({}: DashboardProps) {
       }
       return next
     })
+  }
+
+  // 修改自动刷新间隔（秒）。空值按 0（关闭）处理，负数忽略；持久化到 localStorage。
+  const handleRefreshSecondsChange = (raw: string) => {
+    const n = raw.trim() === '' ? 0 : parseInt(raw, 10)
+    if (Number.isNaN(n) || n < 0) return
+    setRefreshSeconds(n)
+    storage.setRefreshSeconds(n)
   }
 
   // 批量删除（仅删除已禁用项）
@@ -763,6 +775,18 @@ export function Dashboard({}: DashboardProps) {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-4">
               <h2 className="text-xl font-semibold">凭据管理</h2>
+              <div className="flex items-center gap-1.5" title="凭据列表自动刷新间隔，0 = 关闭自动刷新">
+                <RefreshCw className="h-3.5 w-3.5 text-muted-foreground" />
+                <span className="text-sm text-muted-foreground">刷新</span>
+                <Input
+                  type="number"
+                  min="0"
+                  value={String(refreshSeconds)}
+                  onChange={(e) => handleRefreshSecondsChange(e.target.value)}
+                  className="w-16 h-8 text-sm"
+                />
+                <span className="text-sm text-muted-foreground">秒</span>
+              </div>
               <Button onClick={toggleSelectAllCurrentPage} size="sm" variant="outline">
                 {currentCredentials.length > 0 && currentCredentials.every(c => selectedIds.has(c.id))
                   ? '取消全选'

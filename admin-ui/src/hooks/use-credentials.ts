@@ -17,11 +17,12 @@ import {
 import type { AddCredentialRequest } from '@/types/api'
 
 // 查询凭据列表
-export function useCredentials() {
+// refreshSeconds: 自动刷新间隔（秒），<=0 表示关闭自动刷新
+export function useCredentials(refreshSeconds = 3) {
   return useQuery({
     queryKey: ['credentials'],
     queryFn: getCredentials,
-    refetchInterval: 30000, // 每 30 秒刷新一次
+    refetchInterval: refreshSeconds > 0 ? refreshSeconds * 1000 : false,
   })
 }
 
