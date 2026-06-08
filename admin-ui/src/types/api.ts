@@ -28,6 +28,9 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
+  maxConcurrency: number
+  activeConcurrency: number
+  waitingConcurrency: number
 }
 
 // 余额响应
@@ -70,6 +73,15 @@ export interface SetPriorityRequest {
   priority: number
 }
 
+export interface SetConcurrencyRequest {
+  maxConcurrency: number
+}
+
+export interface BatchSetConcurrencyRequest {
+  ids: number[]
+  maxConcurrency: number
+}
+
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string
@@ -86,6 +98,7 @@ export interface AddCredentialRequest {
   proxyPassword?: string
   kiroApiKey?: string
   endpoint?: string
+  maxConcurrency?: number
 }
 
 // 添加凭据响应

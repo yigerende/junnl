@@ -64,6 +64,12 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 并发硬上限（0 = 不限制）
+    pub max_concurrency: u32,
+    /// 当前在途请求数
+    pub active_concurrency: u32,
+    /// 当前等待该凭据释放槽位的请求数
+    pub waiting_concurrency: u32,
 }
 
 // ============ 操作请求 ============
@@ -82,6 +88,24 @@ pub struct SetDisabledRequest {
 pub struct SetPriorityRequest {
     /// 新优先级值
     pub priority: u32,
+}
+
+/// 设置单个凭据并发上限请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetConcurrencyRequest {
+    /// 并发硬上限（0 = 不限制）
+    pub max_concurrency: u32,
+}
+
+/// 批量设置凭据并发上限请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSetConcurrencyRequest {
+    /// 目标凭据 ID 列表
+    pub ids: Vec<u64>,
+    /// 并发硬上限（0 = 不限制）
+    pub max_concurrency: u32,
 }
 
 /// 添加凭据请求
@@ -142,6 +166,10 @@ pub struct AddCredentialRequest {
     /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 凭据并发硬上限（可选，0 = 不限制，默认）
+    #[serde(default)]
+    pub max_concurrency: u32,
 }
 
 fn default_auth_method() -> String {

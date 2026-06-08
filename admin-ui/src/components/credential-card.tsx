@@ -21,6 +21,7 @@ import { getCredentialBalance } from '@/api/credentials'
 import {
   useSetDisabled,
   useSetPriority,
+  useSetConcurrency,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
@@ -64,12 +65,15 @@ export function CredentialCard({
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
+  const [editingConcurrency, setEditingConcurrency] = useState(false)
+  const [concurrencyValue, setConcurrencyValue] = useState(String(credential.maxConcurrency))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   const [confirmingOverage, setConfirmingOverage] = useState(false)
   const [testingAlive, setTestingAlive] = useState(false)
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
+  const setConcurrency = useSetConcurrency()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
@@ -132,6 +136,26 @@ export function CredentialCard({
         onSuccess: (res) => {
           toast.success(res.message)
           setEditingPriority(false)
+        },
+        onError: (err) => {
+          toast.error('操作失败: ' + (err as Error).message)
+        },
+      }
+    )
+  }
+
+  const handleConcurrencyChange = () => {
+    const newMax = parseInt(concurrencyValue, 10)
+    if (isNaN(newMax) || newMax < 0) {
+      toast.error('并发上限必须是非负整数（0 = 不限制）')
+      return
+    }
+    setConcurrency.mutate(
+      { id: credential.id, maxConcurrency: newMax },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingConcurrency(false)
         },
         onError: (err) => {
           toast.error('操作失败: ' + (err as Error).message)
@@ -292,6 +316,65 @@ export function CredentialCard({
             <div>
               <span className="text-muted-foreground">成功次数：</span>
               <span className="font-medium">{credential.successCount}</span>
+            </div>
+            <div className="col-span-2">
+              <span className="text-muted-foreground">并发：</span>
+              <span
+                className={
+                  'font-medium ' +
+                  (credential.activeConcurrency > 0 ? 'text-blue-600' : '')
+                }
+              >
+                {credential.activeConcurrency} /{' '}
+                {credential.maxConcurrency === 0 ? '∞' : credential.maxConcurrency}
+              </span>
+              {credential.waitingConcurrency > 0 && (
+                <span className="text-xs text-amber-600 ml-1">
+                  (等待 {credential.waitingConcurrency})
+                </span>
+              )}
+              {editingConcurrency ? (
+                <span className="inline-flex items-center gap-1 ml-2">
+                  <Input
+                    type="number"
+                    value={concurrencyValue}
+                    onChange={(e) => setConcurrencyValue(e.target.value)}
+                    className="w-16 h-7 text-sm"
+                    min="0"
+                    title="0 = 不限制"
+                  />
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 w-7 p-0"
+                    onClick={handleConcurrencyChange}
+                    disabled={setConcurrency.isPending}
+                  >
+                    ✓
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 w-7 p-0"
+                    onClick={() => {
+                      setEditingConcurrency(false)
+                      setConcurrencyValue(String(credential.maxConcurrency))
+                    }}
+                  >
+                    ✕
+                  </Button>
+                </span>
+              ) : (
+                <span
+                  className="text-xs text-muted-foreground cursor-pointer hover:underline ml-2"
+                  onClick={() => {
+                    setConcurrencyValue(String(credential.maxConcurrency))
+                    setEditingConcurrency(true)
+                  }}
+                >
+                  (设置上限)
+                </span>
+              )}
             </div>
             <div className="col-span-2">
               <span className="text-muted-foreground">最后调用：</span>

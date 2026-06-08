@@ -125,6 +125,14 @@ pub struct KiroCredentials {
     /// 端点名必须在启动时注册的端点 registry 中存在。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 凭据并发硬上限（0 = 不限制，默认）
+    ///
+    /// 当 > 0 时，调度层会跳过 `active >= max_concurrency` 的凭据（满载），
+    /// 实现第二层兜底保护，避免单个凭据被打爆。旧配置文件无此字段时默认 0。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_zero")]
+    pub max_concurrency: u32,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -416,6 +424,7 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            max_concurrency: 0,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -578,6 +587,7 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            max_concurrency: 0,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -610,6 +620,7 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            max_concurrency: 0,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -725,6 +736,7 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            max_concurrency: 0,
         };
 
         let json = original.to_pretty_json().unwrap();

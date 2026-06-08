@@ -128,6 +128,9 @@ impl AdminService {
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                max_concurrency: entry.max_concurrency,
+                active_concurrency: entry.active_concurrency,
+                waiting_concurrency: entry.waiting_concurrency,
             })
             .collect();
 
@@ -164,6 +167,28 @@ impl AdminService {
         self.token_manager
             .set_priority(id, priority)
             .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置单个凭据并发上限（0 = 不限制）
+    pub fn set_max_concurrency(
+        &self,
+        id: u64,
+        max_concurrency: u32,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_max_concurrency(id, max_concurrency)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 批量设置凭据并发上限（0 = 不限制），返回实际生效数量
+    pub fn set_max_concurrency_batch(
+        &self,
+        ids: &[u64],
+        max_concurrency: u32,
+    ) -> Result<usize, AdminServiceError> {
+        self.token_manager
+            .set_max_concurrency_batch(ids, max_concurrency)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))
     }
 
     /// 重置失败计数并重新启用
@@ -363,6 +388,7 @@ impl AdminService {
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
+            max_concurrency: req.max_concurrency,
         };
 
         // 调用 token_manager 添加凭据

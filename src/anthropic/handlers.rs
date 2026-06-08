@@ -436,6 +436,18 @@ fn map_provider_error(err: Error, estimated_input_tokens: i32) -> Response {
         )
             .into_response();
     }
+    // 并发繁忙：所有可用凭据在途已满（第二层硬上限兜底），映射为 429 让客户端稍后重试
+    if err_str.contains("CONCURRENCY_BUSY") {
+        tracing::warn!(error = %err, "并发繁忙：所有可用凭据在途已满");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                "All credentials are at maximum concurrency. Please retry shortly.".to_string(),
+            )),
+        )
+            .into_response();
+    }
     tracing::error!("Kiro API 调用失败: {}", err);
     (
         StatusCode::BAD_GATEWAY,
@@ -932,6 +944,8 @@ async fn handle_stream_request(
         tool_name_map,
     );
     ctx.cache_optimizer = Some(cache_optimizer);
+    // 并发槽位守卫随 StreamContext 持有到 stream_end 后 drop
+    ctx.slot_guard = Some(api_result.slot_guard);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1113,6 +1127,9 @@ async fn handle_non_stream_request(
         api_result.session_affinity_hit,
         true,
     );
+    // 并发槽位守卫：显式持有到本函数返回（body 读完、响应构建完毕）后再 drop。
+    // 非流式无 stream_end，靠此 binding 的作用域保证槽位不被提前释放。
+    let _slot_guard = api_result.slot_guard;
 
     let final_cache_context = match (cache_tracker, cache_profile) {
         (Some(tracker), Some(profile)) => {
@@ -1735,6 +1752,8 @@ async fn handle_stream_request_buffered(
         tool_name_map,
     );
     ctx.set_cache_optimizer(cache_optimizer);
+    // 并发槽位守卫随 BufferedStreamContext 持有到 stream_end 后 drop
+    ctx.set_slot_guard(api_result.slot_guard);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(api_result.response, ctx);

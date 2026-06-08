@@ -6,6 +6,8 @@ import type {
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
+  SetConcurrencyRequest,
+  BatchSetConcurrencyRequest,
   AddCredentialRequest,
   AddCredentialResponse,
   CacheOptimizerConfig,
@@ -65,6 +67,30 @@ export async function resetCredentialFailure(
   id: number
 ): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/reset`)
+  return data
+}
+
+// 设置单个凭据并发上限（0 = 不限制）
+export async function setCredentialConcurrency(
+  id: number,
+  maxConcurrency: number
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/concurrency`,
+    { maxConcurrency } as SetConcurrencyRequest
+  )
+  return data
+}
+
+// 批量设置凭据并发上限（0 = 不限制）
+export async function batchSetConcurrency(
+  ids: number[],
+  maxConcurrency: number
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/concurrency/batch`,
+    { ids, maxConcurrency } as BatchSetConcurrencyRequest
+  )
   return data
 }
 

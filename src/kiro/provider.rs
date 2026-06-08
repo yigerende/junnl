@@ -16,7 +16,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{ConcurrencyGuard, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -26,6 +26,9 @@ pub struct ApiCallResult {
     pub credential_id: u64,
     /// 是否命中会话亲和（仅供调用日志展示）
     pub session_affinity_hit: bool,
+    /// 并发槽位守卫：必须随响应（流式/非流式）一路持有到 body 读完，
+    /// drop 时自动释放该凭据的在途计数。详见 token_manager::ConcurrencyGuard。
+    pub slot_guard: ConcurrencyGuard,
 }
 
 /// 每个凭据的最大重试次数
@@ -176,7 +179,7 @@ impl KiroProvider {
     }
 
     async fn fetch_available_models(&self) -> anyhow::Result<Vec<KiroAvailableModel>> {
-        let ctx = self.token_manager.acquire_context(None).await?;
+        let (ctx, _slot_guard) = self.token_manager.acquire_context(None).await?;
         let config = self.token_manager.config();
         let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
         let endpoint = self.endpoint_for(&ctx.credentials)?;
@@ -266,7 +269,9 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            // _slot_guard 在本次循环迭代内持有该凭据的并发槽位，迭代结束（continue/return）
+            // 时自动释放。MCP 为快速工具调用，body 在 provider 返回后立即读取，槽位略早释放可接受。
+            let (ctx, _slot_guard) = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -429,14 +434,22 @@ impl KiroProvider {
         let session_key = Self::extract_conversation_id_from_request(request_body);
 
         for attempt in 0..max_retries {
-            // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self
+            // 获取调用上下文（绑定 index、credentials、token）+ 并发槽位守卫。
+            // slot_guard 是本次循环迭代的局部变量：成功时随 ApiCallResult 透传到 handlers
+            // 持有到流读完；任何 continue（429 退避 / 402 切号 / 网络错误）时作为局部变量
+            // 自动 drop，旧凭据的在途槽位随之释放，无需任何手动释放代码（方案 §五）。
+            let (ctx, slot_guard) = match self
                 .token_manager
                 .acquire_context_for_session(model.as_deref(), session_key.as_deref())
                 .await
             {
                 Ok(c) => c,
                 Err(e) => {
+                    // 并发繁忙（所有可用凭据在途已满）：reserve 内部已等待约 2 秒，
+                    // 重试只会叠加更多等待且大概率仍然满载，直接返回让 handler 映射 429。
+                    if e.to_string().contains("CONCURRENCY_BUSY") {
+                        return Err(e);
+                    }
                     last_error = Some(e);
                     continue;
                 }
@@ -500,6 +513,7 @@ impl KiroProvider {
                     response,
                     credential_id: ctx.id,
                     session_affinity_hit: ctx.session_affinity_hit,
+                    slot_guard,
                 });
             }
 

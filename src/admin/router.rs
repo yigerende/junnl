@@ -7,11 +7,12 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, clear_call_logs, delete_credential, download_log_file, force_refresh_token,
-        get_all_credentials, get_available_models, get_cache_optimizer, get_cached_balances,
-        get_call_logs, get_credential_balance, get_load_balancing_mode, get_log_info,
-        get_model_mapping, get_runtime_logs, reset_failure_count, set_cache_optimizer,
-        set_call_log_capacity, set_credential_disabled, set_credential_overage,
+        add_credential, batch_set_concurrency, clear_call_logs, delete_credential,
+        download_log_file, force_refresh_token, get_all_credentials, get_available_models,
+        get_cache_optimizer, get_cached_balances, get_call_logs, get_credential_balance,
+        get_load_balancing_mode, get_log_info, get_model_mapping, get_runtime_logs,
+        reset_failure_count, set_cache_optimizer, set_call_log_capacity,
+        set_credential_concurrency, set_credential_disabled, set_credential_overage,
         set_credential_priority, set_load_balancing_mode, set_model_mapping, stream_runtime_logs,
     },
     middleware::{AdminState, admin_auth_middleware},
@@ -42,8 +43,16 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_all_credentials).post(add_credential),
         )
         .route("/credentials/{id}", delete(delete_credential))
+        .route(
+            "/credentials/concurrency/batch",
+            post(batch_set_concurrency),
+        )
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
+        .route(
+            "/credentials/{id}/concurrency",
+            post(set_credential_concurrency),
+        )
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))

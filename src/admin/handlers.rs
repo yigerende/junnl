@@ -14,8 +14,8 @@ use std::convert::Infallible;
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, BatchSetConcurrencyRequest, SetConcurrencyRequest,
+        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
     },
 };
 use crate::model::config::{CacheOptimizerConfig, ModelMappingConfig};
@@ -72,6 +72,59 @@ pub async fn reset_failure_count(
             id
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/concurrency
+/// 设置单个凭据的并发硬上限（0 = 不限制）
+pub async fn set_credential_concurrency(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetConcurrencyRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .set_max_concurrency(id, payload.max_concurrency)
+    {
+        Ok(_) => {
+            let desc = if payload.max_concurrency == 0 {
+                "不限制".to_string()
+            } else {
+                payload.max_concurrency.to_string()
+            };
+            Json(SuccessResponse::new(format!(
+                "凭据 #{} 并发上限已设置为 {}",
+                id, desc
+            )))
+            .into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/concurrency/batch
+/// 批量设置凭据并发硬上限（0 = 不限制）
+pub async fn batch_set_concurrency(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchSetConcurrencyRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .set_max_concurrency_batch(&payload.ids, payload.max_concurrency)
+    {
+        Ok(applied) => {
+            let desc = if payload.max_concurrency == 0 {
+                "不限制".to_string()
+            } else {
+                payload.max_concurrency.to_string()
+            };
+            Json(SuccessResponse::new(format!(
+                "已为 {} 个凭据设置并发上限 {}",
+                applied, desc
+            )))
+            .into_response()
+        }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

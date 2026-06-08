@@ -9,6 +9,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
+use crate::kiro::token_manager::ConcurrencyGuard;
 use crate::model::config::CacheOptimizerConfig;
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
@@ -571,6 +572,9 @@ pub struct StreamContext {
     pub cache_optimizer: Option<Arc<parking_lot::RwLock<CacheOptimizerConfig>>>,
     /// 当前响应路径类型
     pub response_path: super::cache_rewriter::ResponsePath,
+    /// 并发槽位守卫：持有到流读完（stream_end）后随 StreamContext 一起 drop，
+    /// 自动释放该凭据在途计数。客户端断开/出错/panic 时 unfold 状态被丢弃，同样会 drop。
+    pub slot_guard: Option<ConcurrencyGuard>,
 }
 
 impl StreamContext {
@@ -613,6 +617,7 @@ impl StreamContext {
             strip_thinking_leading_newline: false,
             cache_optimizer: None,
             response_path: super::cache_rewriter::ResponsePath::Stream,
+            slot_guard: None,
         }
     }
 
@@ -1448,6 +1453,11 @@ impl BufferedStreamContext {
     ) {
         self.inner.cache_optimizer = Some(optimizer);
         self.inner.response_path = super::cache_rewriter::ResponsePath::Buffered;
+    }
+
+    /// 设置并发槽位守卫，随 BufferedStreamContext 持有到流读完后 drop。
+    pub fn set_slot_guard(&mut self, guard: ConcurrencyGuard) {
+        self.inner.slot_guard = Some(guard);
     }
 
     /// 处理 Kiro 事件并缓冲结果

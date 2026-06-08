@@ -3,6 +3,8 @@ import {
   getCredentials,
   setCredentialDisabled,
   setCredentialPriority,
+  setCredentialConcurrency,
+  batchSetConcurrency,
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
@@ -65,6 +67,30 @@ export function useSetPriority() {
   return useMutation({
     mutationFn: ({ id, priority }: { id: number; priority: number }) =>
       setCredentialPriority(id, priority),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 设置单个凭据并发上限
+export function useSetConcurrency() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, maxConcurrency }: { id: number; maxConcurrency: number }) =>
+      setCredentialConcurrency(id, maxConcurrency),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 批量设置凭据并发上限
+export function useBatchSetConcurrency() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ ids, maxConcurrency }: { ids: number[]; maxConcurrency: number }) =>
+      batchSetConcurrency(ids, maxConcurrency),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, AlertTriangle, Ban, Activity, Globe, Wallet, DollarSign } from 'lucide-react'
+import { RefreshCw, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, AlertTriangle, Ban, Activity, Wallet, DollarSign, Gauge } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -11,7 +11,7 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useBatchSetConcurrency } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken, getCachedBalances } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
@@ -45,6 +45,7 @@ export function Dashboard({}: DashboardProps) {
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
+  const { mutateAsync: batchSetConcurrencyAsync, isPending: isSettingConcurrency } = useBatchSetConcurrency()
 
   // 计算分页
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
@@ -219,6 +220,31 @@ export function Dashboard({}: DashboardProps) {
     }
 
     deselectAll()
+  }
+
+  // 批量设置并发上限（0 = 不限制）
+  const handleBatchSetConcurrency = async () => {
+    if (selectedIds.size === 0) {
+      toast.error('请先选择要设置的凭据')
+      return
+    }
+    const input = window.prompt(
+      `为选中的 ${selectedIds.size} 个凭据设置并发上限（0 = 不限制）：`,
+      '0'
+    )
+    if (input === null) return
+    const max = parseInt(input, 10)
+    if (isNaN(max) || max < 0) {
+      toast.error('并发上限必须是非负整数（0 = 不限制）')
+      return
+    }
+    try {
+      const res = await batchSetConcurrencyAsync({ ids: Array.from(selectedIds), maxConcurrency: max })
+      toast.success(res.message)
+      refetch()
+    } catch (err) {
+      toast.error('批量设置失败: ' + extractErrorMessage(err))
+    }
   }
 
   // 批量恢复异常
@@ -662,13 +688,25 @@ export function Dashboard({}: DashboardProps) {
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground flex items-center gap-1.5">
-                <Globe className="h-3.5 w-3.5 text-purple-500" />
-                使用代理
+                <Gauge className="h-3.5 w-3.5 text-purple-500" />
+                并发在途
               </CardTitle>
             </CardHeader>
             <CardContent>
               <div className="text-2xl font-bold text-purple-500">
-                {data?.credentials.filter(c => c.hasProxy).length || 0}
+                {data?.credentials.reduce((sum, c) => sum + c.activeConcurrency, 0) || 0}
+                <span className="text-base font-normal text-muted-foreground ml-1">
+                  /{' '}
+                  {data?.credentials.some(c => c.maxConcurrency > 0) &&
+                  data?.credentials.every(c => c.maxConcurrency > 0)
+                    ? data?.credentials.reduce((sum, c) => sum + c.maxConcurrency, 0)
+                    : '∞'}
+                </span>
+                {(data?.credentials.reduce((sum, c) => sum + c.waitingConcurrency, 0) || 0) > 0 && (
+                  <span className="text-xs text-amber-600 ml-2">
+                    等待 {data?.credentials.reduce((sum, c) => sum + c.waitingConcurrency, 0)}
+                  </span>
+                )}
               </div>
             </CardContent>
           </Card>
@@ -758,6 +796,15 @@ export function Dashboard({}: DashboardProps) {
                   <Button onClick={handleBatchResetFailure} size="sm" variant="outline">
                     <RotateCcw className="h-4 w-4 mr-2" />
                     恢复异常
+                  </Button>
+                  <Button
+                    onClick={handleBatchSetConcurrency}
+                    size="sm"
+                    variant="outline"
+                    disabled={isSettingConcurrency}
+                  >
+                    <Gauge className="h-4 w-4 mr-2" />
+                    批量设置并发
                   </Button>
                   <Button
                     onClick={handleBatchDelete}
