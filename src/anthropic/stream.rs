@@ -1225,8 +1225,23 @@ impl StreamContext {
         let cache_usage = self.cache_usage.map(|cache_usage| {
             scale_cache_usage(cache_usage, self.input_tokens, final_input_tokens)
         });
-        // 如果模拟缓存开启，改写 cache 字段（含 5m/1h 拆分同步）
+        // 探活豁免：请求输入过小（如渠道探活）时，完全不改写，原样真实返回
+        let bypass = self
+            .cache_optimizer
+            .as_ref()
+            .map(|o| {
+                super::cache_rewriter::should_bypass_for_probe(
+                    &o.read(),
+                    self.response_path,
+                    self.input_tokens,
+                )
+            })
+            .unwrap_or(false);
+        // 如果模拟缓存开启且未豁免，改写 cache 字段（含 5m/1h 拆分同步）+ 按真实输入放大
         let cache_usage = cache_usage.map(|mut cu| {
+            if bypass {
+                return cu;
+            }
             if let Some(optimizer) = &self.cache_optimizer {
                 let config = optimizer.read();
                 let (new_read, new_write, new_5m, new_1h) =
@@ -1237,6 +1252,15 @@ impl StreamContext {
                         cu.cache_creation_1h_input_tokens,
                         &config,
                         self.response_path,
+                    );
+                let (new_read, new_write, new_5m, new_1h) =
+                    super::cache_rewriter::apply_input_scale(
+                        new_read,
+                        new_write,
+                        new_5m,
+                        new_1h,
+                        final_input_tokens,
+                        &config,
                     );
                 cu.cache_read_input_tokens = new_read;
                 cu.cache_creation_input_tokens = new_write;
@@ -1249,8 +1273,10 @@ impl StreamContext {
             .map(|cache_usage| billed_input_tokens(final_input_tokens, cache_usage))
             .unwrap_or(final_input_tokens);
 
-        // 如果模拟缓存开启且配置了 input 随机上限，替换 reported_input_tokens
-        let reported_input_tokens = if let Some(optimizer) = &self.cache_optimizer {
+        // 如果模拟缓存开启且配置了 input 随机上限，替换 reported_input_tokens（豁免时不替换）
+        let reported_input_tokens = if bypass {
+            reported_input_tokens
+        } else if let Some(optimizer) = &self.cache_optimizer {
             super::cache_rewriter::rewrite_input_tokens(&optimizer.read(), self.response_path)
                 .unwrap_or(reported_input_tokens)
         } else {
@@ -1466,10 +1492,24 @@ impl BufferedStreamContext {
         let cache_usage = self.inner.cache_usage.map(|cache_usage| {
             scale_cache_usage(cache_usage, self.inner.input_tokens, final_input_tokens)
         });
-        // 如果模拟缓存开启，改写 cache 字段（含 5m/1h 拆分同步，与非缓冲/非流式一致）。
-        // 缓冲流式此前漏改这一步，导致 /cc/v1 的 message_start 写入上游真实缓存读写值，
-        // 绕过了配置的改写上限。
+        // 探活豁免：请求输入过小（如渠道探活）时，完全不改写，原样真实返回
+        let bypass = self
+            .inner
+            .cache_optimizer
+            .as_ref()
+            .map(|o| {
+                super::cache_rewriter::should_bypass_for_probe(
+                    &o.read(),
+                    self.inner.response_path,
+                    self.inner.input_tokens,
+                )
+            })
+            .unwrap_or(false);
+        // 如果模拟缓存开启且未豁免，改写 cache 字段（含 5m/1h 同步）+ 按真实输入放大
         let cache_usage = cache_usage.map(|mut cu| {
+            if bypass {
+                return cu;
+            }
             if let Some(optimizer) = &self.inner.cache_optimizer {
                 let config = optimizer.read();
                 let (new_read, new_write, new_5m, new_1h) =
@@ -1480,6 +1520,15 @@ impl BufferedStreamContext {
                         cu.cache_creation_1h_input_tokens,
                         &config,
                         self.inner.response_path,
+                    );
+                let (new_read, new_write, new_5m, new_1h) =
+                    super::cache_rewriter::apply_input_scale(
+                        new_read,
+                        new_write,
+                        new_5m,
+                        new_1h,
+                        final_input_tokens,
+                        &config,
                     );
                 cu.cache_read_input_tokens = new_read;
                 cu.cache_creation_input_tokens = new_write;
@@ -1492,9 +1541,10 @@ impl BufferedStreamContext {
             .map(|cache_usage| billed_input_tokens(final_input_tokens, cache_usage))
             .unwrap_or(final_input_tokens);
 
-        // 如果模拟缓存开启且配置了 input 随机上限，替换 message_start 的 input_tokens
-        // （与 message_delta 保持一致，否则缓冲流式下游读到的是 message_start 的真实大值）
-        let reported_input_tokens = if let Some(optimizer) = &self.inner.cache_optimizer {
+        // 如果模拟缓存开启且配置了 input 随机上限，替换 message_start 的 input_tokens（豁免时不替换）
+        let reported_input_tokens = if bypass {
+            reported_input_tokens
+        } else if let Some(optimizer) = &self.inner.cache_optimizer {
             super::cache_rewriter::rewrite_input_tokens(&optimizer.read(), self.inner.response_path)
                 .unwrap_or(reported_input_tokens)
         } else {

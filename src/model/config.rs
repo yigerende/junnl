@@ -25,6 +25,17 @@ pub struct CacheSegment {
     pub weight: u32,
 }
 
+/// 输入放大分档：真实输入 token 落在 [min, max] 时，读/写缓存分别乘对应倍率。
+/// 倍率支持 1 位小数（如 1.5、2.3）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputScaleSegment {
+    pub min: u64,
+    pub max: u64,
+    pub read_multiplier: f64,
+    pub write_multiplier: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheOptimizerConfig {
@@ -86,6 +97,35 @@ pub struct CacheOptimizerConfig {
     /// =0 表示不替换（保持原有计算逻辑）。仅在模拟缓存开启时生效。
     #[serde(default)]
     pub input_random_max: u32,
+
+    // ===== 探活豁免：请求输入过小时（如渠道探活）完全不改写，原样真实返回 =====
+    /// 探活豁免阈值：请求输入 token ≤ 此值时豁免改写。None=不启用豁免。
+    /// 判断依据是「请求进来时估算的输入」，不是上游返回值。
+    #[serde(default)]
+    pub probe_bypass_max_input_tokens: Option<u64>,
+    /// 流式请求是否参与探活豁免
+    #[serde(default)]
+    pub probe_bypass_stream: bool,
+    /// 非流式请求是否参与探活豁免
+    #[serde(default)]
+    pub probe_bypass_non_stream: bool,
+    /// 缓冲流式（/cc）请求是否参与探活豁免
+    #[serde(default)]
+    pub probe_bypass_buffered: bool,
+
+    // ===== 输入放大：按上游真实输入分档，对模拟改写后的读/写缓存乘倍率 =====
+    /// 输入放大总开关，仅在模拟缓存开启时生效
+    #[serde(default)]
+    pub input_scale_enabled: bool,
+    /// 放大后读缓存上限。None=不封顶。与 read_max 独立。
+    #[serde(default)]
+    pub input_scale_max_read: Option<u64>,
+    /// 放大后写缓存上限。None=不封顶。与 write_max 独立。
+    #[serde(default)]
+    pub input_scale_max_write: Option<u64>,
+    /// 输入放大分档（按 final_input_tokens 落档，读/写各自倍率）
+    #[serde(default)]
+    pub input_scale_segments: Vec<InputScaleSegment>,
 }
 
 fn default_cache_optimizer_mode() -> String {
@@ -170,6 +210,14 @@ impl Default for CacheOptimizerConfig {
             rewrite_only_when_present: true,
             keep_raw_breakdown: true,
             input_random_max: 0,
+            probe_bypass_max_input_tokens: None,
+            probe_bypass_stream: false,
+            probe_bypass_non_stream: false,
+            probe_bypass_buffered: false,
+            input_scale_enabled: false,
+            input_scale_max_read: None,
+            input_scale_max_write: None,
+            input_scale_segments: Vec::new(),
         }
     }
 }

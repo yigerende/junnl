@@ -7,6 +7,94 @@ pub(crate) enum ResponsePath {
     Buffered,
 }
 
+/// 探活豁免判断：请求输入过小（如渠道探活）时，应跳过模拟缓存改写、原样真实返回。
+///
+/// 条件（全部满足才豁免）：
+/// 1. 配置了阈值 `probe_bypass_max_input_tokens`（None=不启用）
+/// 2. 当前响应路径在豁免开关里被勾选
+/// 3. 请求输入 token（估算值，非上游返回）≤ 阈值
+///
+/// `request_input_tokens` 必须是「请求进来时估算的输入」。
+pub(crate) fn should_bypass_for_probe(
+    config: &CacheOptimizerConfig,
+    path: ResponsePath,
+    request_input_tokens: i32,
+) -> bool {
+    let Some(threshold) = config.probe_bypass_max_input_tokens else {
+        return false;
+    };
+    let path_enabled = match path {
+        ResponsePath::Stream => config.probe_bypass_stream,
+        ResponsePath::NonStream => config.probe_bypass_non_stream,
+        ResponsePath::Buffered => config.probe_bypass_buffered,
+    };
+    if !path_enabled {
+        return false;
+    }
+    request_input_tokens >= 0 && (request_input_tokens as u64) <= threshold
+}
+
+/// 输入放大：按上游真实输入分档，对（模拟改写后的）读/写缓存乘倍率。
+///
+/// - 仅在 `enabled && input_scale_enabled` 时生效
+/// - 用 `final_input_tokens`（上游真实输入）落档
+/// - 只对 >0 的读/写值乘倍率（=0 保持 0，不破坏只读/只写形态）
+/// - 乘后受 input_scale_max_read / input_scale_max_write 封顶（None=不封顶）
+/// - 5m/1h 跟随改写后的写总值同步
+///
+/// 入参/返回均为 `(read, creation_total, creation_5m, creation_1h)`。
+pub(crate) fn apply_input_scale(
+    read: i32,
+    creation: i32,
+    creation_5m: i32,
+    creation_1h: i32,
+    final_input_tokens: i32,
+    config: &CacheOptimizerConfig,
+) -> (i32, i32, i32, i32) {
+    if !config.enabled || !config.input_scale_enabled {
+        return (read, creation, creation_5m, creation_1h);
+    }
+    // 找真实输入落在哪个分档
+    let input = final_input_tokens.max(0) as u64;
+    let Some(seg) = config
+        .input_scale_segments
+        .iter()
+        .find(|s| input >= s.min && input <= s.max)
+    else {
+        return (read, creation, creation_5m, creation_1h);
+    };
+
+    // 乘倍率（仅对 >0 的值），再按独立上限封顶
+    let new_read = if read > 0 {
+        scale_and_cap(read, seg.read_multiplier, config.input_scale_max_read)
+    } else {
+        read
+    };
+    let new_creation = if creation > 0 {
+        scale_and_cap(creation, seg.write_multiplier, config.input_scale_max_write)
+    } else {
+        creation
+    };
+
+    // 写总值变化时，5m/1h 同步（归整到 5m，清 1h）
+    if new_creation != creation {
+        (new_read, new_creation, new_creation, 0)
+    } else {
+        (new_read, new_creation, creation_5m, creation_1h)
+    }
+}
+
+/// 乘倍率并按上限封顶（倍率支持 1 位小数；None 上限=不封顶）。
+fn scale_and_cap(value: i32, multiplier: f64, max: Option<u64>) -> i32 {
+    let scaled = ((value as f64) * multiplier).round();
+    let scaled = if scaled < 0.0 { 0.0 } else { scaled };
+    let mut result = scaled as i64;
+    if let Some(cap) = max {
+        result = result.min(cap as i64);
+    }
+    result.min(i32::MAX as i64) as i32
+}
+
 pub(crate) fn rewrite_cache_usage(
     raw_read: i32,
     raw_write: i32,
@@ -479,5 +567,109 @@ mod tests {
             // 5m/1h 同步：改写后(总值变了)5m+1h == creation
             assert_eq!(c5m + c1h, creation, "5m+1h 必须等于写总值");
         }
+    }
+
+    // ===== 探活豁免测试 =====
+    #[test]
+    fn probe_bypass_disabled_when_no_threshold() {
+        let config = make_config("weighted", true); // 默认无 probe_bypass_max_input_tokens
+        assert!(!should_bypass_for_probe(
+            &config,
+            ResponsePath::NonStream,
+            5
+        ));
+    }
+
+    #[test]
+    fn probe_bypass_respects_threshold_and_path() {
+        let mut config = make_config("weighted", true);
+        config.probe_bypass_max_input_tokens = Some(100);
+        config.probe_bypass_non_stream = true;
+        // 非流式 + 输入≤阈值 → 豁免
+        assert!(should_bypass_for_probe(
+            &config,
+            ResponsePath::NonStream,
+            100
+        ));
+        assert!(should_bypass_for_probe(
+            &config,
+            ResponsePath::NonStream,
+            50
+        ));
+        // 超过阈值 → 不豁免
+        assert!(!should_bypass_for_probe(
+            &config,
+            ResponsePath::NonStream,
+            101
+        ));
+        // 流式没勾选 → 不豁免（即便输入小）
+        assert!(!should_bypass_for_probe(&config, ResponsePath::Stream, 10));
+    }
+
+    // ===== 输入放大测试 =====
+    fn scale_config() -> CacheOptimizerConfig {
+        let mut c = make_config("weighted", true);
+        c.input_scale_enabled = true;
+        c.input_scale_segments = vec![
+            crate::model::config::InputScaleSegment {
+                min: 0,
+                max: 20_000,
+                read_multiplier: 1.0,
+                write_multiplier: 1.0,
+            },
+            crate::model::config::InputScaleSegment {
+                min: 20_001,
+                max: 120_000,
+                read_multiplier: 2.0,
+                write_multiplier: 3.0,
+            },
+        ];
+        c
+    }
+
+    #[test]
+    fn input_scale_multiplies_by_segment() {
+        let config = scale_config();
+        // 真实输入 60000 落第二档 → read×2, write×3
+        let (r, c, m5, _h1) = apply_input_scale(1000, 500, 500, 0, 60_000, &config);
+        assert_eq!(r, 2000);
+        assert_eq!(c, 1500);
+        assert_eq!(m5, 1500); // 写变了，5m 同步
+    }
+
+    #[test]
+    fn input_scale_only_touches_nonzero() {
+        let config = scale_config();
+        // 只读形态（write=0）→ write 乘后仍 0
+        let (r, c, _m5, _h1) = apply_input_scale(1000, 0, 0, 0, 60_000, &config);
+        assert_eq!(r, 2000);
+        assert_eq!(c, 0);
+    }
+
+    #[test]
+    fn input_scale_supports_decimal_and_cap() {
+        let mut config = scale_config();
+        config.input_scale_segments[1].read_multiplier = 1.5; // 1位小数
+        config.input_scale_max_read = Some(1200); // 放大后封顶
+        // 1000×1.5=1500，但封顶 1200
+        let (r, _c, _m5, _h1) = apply_input_scale(1000, 0, 0, 0, 60_000, &config);
+        assert_eq!(r, 1200);
+    }
+
+    #[test]
+    fn input_scale_disabled_or_no_segment_is_identity() {
+        // 开关关
+        let mut config = scale_config();
+        config.input_scale_enabled = false;
+        assert_eq!(
+            apply_input_scale(1000, 500, 500, 0, 60_000, &config),
+            (1000, 500, 500, 0)
+        );
+        // 无匹配区间（输入超出所有档）
+        let config = scale_config();
+        assert_eq!(
+            apply_input_scale(1000, 500, 500, 0, 999_999, &config),
+            (1000, 500, 500, 0)
+        );
     }
 }

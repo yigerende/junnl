@@ -103,6 +103,14 @@ export interface CacheSegment {
   weight: number
 }
 
+// 输入放大分档
+export interface InputScaleSegment {
+  min: number
+  max: number
+  readMultiplier: number
+  writeMultiplier: number
+}
+
 // 模拟缓存配置
 export interface CacheOptimizerConfig {
   enabled: boolean
@@ -124,6 +132,16 @@ export interface CacheOptimizerConfig {
   rewriteOnlyWhenPresent: boolean
   keepRawBreakdown: boolean
   inputRandomMax: number
+  // 探活豁免
+  probeBypassMaxInputTokens: number | null
+  probeBypassStream: boolean
+  probeBypassNonStream: boolean
+  probeBypassBuffered: boolean
+  // 输入放大
+  inputScaleEnabled: boolean
+  inputScaleMaxRead: number | null
+  inputScaleMaxWrite: number | null
+  inputScaleSegments: InputScaleSegment[]
 }
 
 // 单条模型映射

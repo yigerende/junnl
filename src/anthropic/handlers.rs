@@ -102,21 +102,76 @@ impl CallLogContext {
     }
 }
 
-/// 从请求头提取来源 IP：X-Forwarded-For（第一个）→ X-Real-IP。
-fn extract_client_ip(headers: &axum::http::HeaderMap) -> Option<String> {
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(first) = xff.split(',').next() {
-            let ip = first.trim();
-            if !ip.is_empty() {
-                return Some(ip.to_string());
+/// 规范化 IP：去掉端口（`1.2.3.4:5678` → `1.2.3.4`，`[::1]:80` → `::1`）。
+fn normalize_ip(raw: &str) -> String {
+    let s = raw.trim();
+    // 先尝试按 SocketAddr 解析（能正确处理 IPv4:port 和 [IPv6]:port）
+    if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
+        return sa.ip().to_string();
+    }
+    // 形如 "1.2.3.4:5678" 但解析失败时，手动按最后一个冒号切（仅 IPv4 形态）
+    if s.matches(':').count() == 1 {
+        if let Some((host, _port)) = s.rsplit_once(':') {
+            if host.parse::<std::net::Ipv4Addr>().is_ok() {
+                return host.to_string();
             }
         }
     }
-    headers
+    s.to_string()
+}
+
+/// 是否私有/回环地址（对齐 sub2：10/8、172.16/12、192.168/16、127/8、::1、fc00::/7）。
+fn is_private_ip(s: &str) -> bool {
+    match s.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            v6.is_loopback()
+                // fc00::/7 唯一本地地址（ULA）
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+        Err(_) => false,
+    }
+}
+
+/// 从请求头提取来源 IP（对齐 sub2 的 GetClientIP 优先级）：
+/// 1. CF-Connecting-IP（Cloudflare）
+/// 2. X-Real-IP（Nginx）
+/// 3. X-Forwarded-For（取第一个公网 IP；全为私有则取第一个）
+/// 均去端口；都没有则返回 None。
+fn extract_client_ip(headers: &axum::http::HeaderMap) -> Option<String> {
+    // 1. Cloudflare
+    if let Some(ip) = headers
+        .get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| normalize_ip(s))
+        .filter(|s| !s.is_empty())
+    {
+        return Some(ip);
+    }
+    // 2. Nginx X-Real-IP
+    if let Some(ip) = headers
         .get("x-real-ip")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim().to_string())
+        .map(|s| normalize_ip(s))
         .filter(|s| !s.is_empty())
+    {
+        return Some(ip);
+    }
+    // 3. X-Forwarded-For：优先取第一个公网 IP，全私有则取第一个
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        let parts: Vec<String> = xff
+            .split(',')
+            .map(|s| normalize_ip(s))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if let Some(public) = parts.iter().find(|ip| !is_private_ip(ip)) {
+            return Some(public.clone());
+        }
+        if let Some(first) = parts.first() {
+            return Some(first.clone());
+        }
+    }
+    None
 }
 
 /// 从请求头提取来源域名（Host）。
@@ -333,17 +388,29 @@ fn scale_token_count(value: i32, estimated_input_tokens: i32, actual_input_token
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
-fn map_provider_error(err: Error) -> Response {
+///
+/// `estimated_input_tokens` 为请求进来时的估算输入 token 数（system + messages + tools）。
+/// 上下文/输入过长类错误会把它写入日志和返回给用户的错误消息，便于定位
+/// 「输入估算多少 token 超了」。错误发生在上游拒绝时，拿不到上游真实输入，故为估算值。
+fn map_provider_error(err: Error, estimated_input_tokens: i32) -> Response {
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
-        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
+        tracing::warn!(
+            error = %err,
+            estimated_input_tokens,
+            "上游拒绝请求：上下文窗口已满，输入估算 ~{} tokens（支持最大 1M，不应重试）",
+            estimated_input_tokens
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
                 "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
+                format!(
+                    "Context window is full. Reduce conversation history, system prompt, or tools. \
+                     (estimated input ~{estimated_input_tokens} tokens, max supported 1M)"
+                ),
             )),
         )
             .into_response();
@@ -351,12 +418,20 @@ fn map_provider_error(err: Error) -> Response {
 
     // 单次输入太长（请求体本身超出上游限制）
     if err_str.contains("Input is too long") {
-        tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
+        tracing::warn!(
+            error = %err,
+            estimated_input_tokens,
+            "上游拒绝请求：输入过长，输入估算 ~{} tokens（支持最大 1M，不应重试）",
+            estimated_input_tokens
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
                 "invalid_request_error",
-                "Input is too long. Reduce the size of your messages.",
+                format!(
+                    "Input is too long. Reduce the size of your messages. \
+                     (estimated input ~{estimated_input_tokens} tokens, max supported 1M)"
+                ),
             )),
         )
             .into_response();
@@ -808,7 +883,7 @@ async fn handle_stream_request(
             );
             // 记录失败的调用日志（未选到可用凭据）
             log_ctx.record(Some(provider.as_ref()), None, false, false);
-            return map_provider_error(e);
+            return map_provider_error(e, input_tokens);
         }
     };
     // 记录调用日志：已选中凭据并连上上游
@@ -1028,7 +1103,7 @@ async fn handle_non_stream_request(
         Err(e) => {
             // 记录失败的调用日志（未选到可用凭据）
             log_ctx.record(Some(provider.as_ref()), None, false, false);
-            return map_provider_error(e);
+            return map_provider_error(e, input_tokens);
         }
     };
     // 记录调用日志：已选中凭据并连上上游
@@ -1274,31 +1349,54 @@ async fn handle_non_stream_request(
             "input_tokens": billed_input_tokens,
             "output_tokens": output_tokens
         });
-        if let Some(mut cache_context) = final_cache_context {
-            // 如果模拟缓存开启，改写 cache 字段（含 5m/1h 拆分同步）
-            let optimizer_config = cache_optimizer.read();
-            let (new_read, new_write, new_5m, new_1h) =
-                super::cache_rewriter::rewrite_cache_usage_with_split(
-                    cache_context.cache_read_input_tokens,
-                    cache_context.cache_creation_input_tokens,
-                    cache_context.cache_creation_5m_input_tokens,
-                    cache_context.cache_creation_1h_input_tokens,
-                    &optimizer_config,
-                    super::cache_rewriter::ResponsePath::NonStream,
-                );
-            cache_context.cache_read_input_tokens = new_read;
-            cache_context.cache_creation_input_tokens = new_write;
-            cache_context.cache_creation_5m_input_tokens = new_5m;
-            cache_context.cache_creation_1h_input_tokens = new_1h;
-            inject_cache_usage_fields(&mut usage, cache_context);
-        }
-
-        // 如果模拟缓存开启且配置了 input 随机上限，替换 input_tokens
-        if let Some(new_input) = super::cache_rewriter::rewrite_input_tokens(
+        // 探活豁免：请求输入过小（如渠道探活）时，完全不改写，原样真实返回
+        let bypass = super::cache_rewriter::should_bypass_for_probe(
             &cache_optimizer.read(),
             super::cache_rewriter::ResponsePath::NonStream,
-        ) {
-            usage["input_tokens"] = json!(new_input);
+            input_tokens,
+        );
+        if let Some(mut cache_context) = final_cache_context {
+            if bypass {
+                // 豁免：cache 字段原样真实返回，不改写、不放大
+                inject_cache_usage_fields(&mut usage, cache_context);
+            } else {
+                // 如果模拟缓存开启，改写 cache 字段（含 5m/1h 拆分同步）
+                let optimizer_config = cache_optimizer.read();
+                let (new_read, new_write, new_5m, new_1h) =
+                    super::cache_rewriter::rewrite_cache_usage_with_split(
+                        cache_context.cache_read_input_tokens,
+                        cache_context.cache_creation_input_tokens,
+                        cache_context.cache_creation_5m_input_tokens,
+                        cache_context.cache_creation_1h_input_tokens,
+                        &optimizer_config,
+                        super::cache_rewriter::ResponsePath::NonStream,
+                    );
+                // 按上游真实输入分档放大读/写缓存
+                let (new_read, new_write, new_5m, new_1h) =
+                    super::cache_rewriter::apply_input_scale(
+                        new_read,
+                        new_write,
+                        new_5m,
+                        new_1h,
+                        final_input_tokens,
+                        &optimizer_config,
+                    );
+                cache_context.cache_read_input_tokens = new_read;
+                cache_context.cache_creation_input_tokens = new_write;
+                cache_context.cache_creation_5m_input_tokens = new_5m;
+                cache_context.cache_creation_1h_input_tokens = new_1h;
+                inject_cache_usage_fields(&mut usage, cache_context);
+            }
+        }
+
+        // 如果模拟缓存开启且配置了 input 随机上限，替换 input_tokens（豁免时不替换）
+        if !bypass {
+            if let Some(new_input) = super::cache_rewriter::rewrite_input_tokens(
+                &cache_optimizer.read(),
+                super::cache_rewriter::ResponsePath::NonStream,
+            ) {
+                usage["input_tokens"] = json!(new_input);
+            }
         }
 
         json!({
@@ -1595,7 +1693,7 @@ async fn handle_stream_request_buffered(
         Ok(resp) => resp,
         Err(e) => {
             log_ctx.record(Some(provider.as_ref()), None, false, false);
-            return map_provider_error(e);
+            return map_provider_error(e, estimated_input_tokens);
         }
     };
     log_ctx.record(
@@ -1956,5 +2054,55 @@ mod ops_cache_tests {
                 .unwrap_or(0);
             assert_eq!(m5 + h1, creation, "5m+1h 必须等于写总值");
         }
+    }
+
+    #[test]
+    fn test_extract_client_ip_priority_and_filtering() {
+        use axum::http::HeaderMap;
+        // CF-Connecting-IP 最高优先
+        let mut h = HeaderMap::new();
+        h.insert("cf-connecting-ip", "1.2.3.4".parse().unwrap());
+        h.insert("x-real-ip", "5.6.7.8".parse().unwrap());
+        h.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
+        assert_eq!(extract_client_ip(&h), Some("1.2.3.4".to_string()));
+
+        // 无 CF 时用 X-Real-IP
+        let mut h = HeaderMap::new();
+        h.insert("x-real-ip", "5.6.7.8".parse().unwrap());
+        h.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
+        assert_eq!(extract_client_ip(&h), Some("5.6.7.8".to_string()));
+
+        // XFF 跳过私有，取第一个公网
+        let mut h = HeaderMap::new();
+        h.insert(
+            "x-forwarded-for",
+            "10.0.0.1, 192.168.1.1, 203.0.113.7".parse().unwrap(),
+        );
+        assert_eq!(extract_client_ip(&h), Some("203.0.113.7".to_string()));
+
+        // XFF 去端口
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "203.0.113.9:54321".parse().unwrap());
+        assert_eq!(extract_client_ip(&h), Some("203.0.113.9".to_string()));
+
+        // XFF 全私有 → 取第一个
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "10.0.0.1, 192.168.1.1".parse().unwrap());
+        assert_eq!(extract_client_ip(&h), Some("10.0.0.1".to_string()));
+
+        // 都没有 → None
+        assert_eq!(extract_client_ip(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn test_normalize_and_private_ip() {
+        assert_eq!(normalize_ip("1.2.3.4:8080"), "1.2.3.4");
+        assert_eq!(normalize_ip("  5.6.7.8  "), "5.6.7.8");
+        assert!(is_private_ip("10.0.0.1"));
+        assert!(is_private_ip("192.168.1.1"));
+        assert!(is_private_ip("172.16.5.5"));
+        assert!(is_private_ip("127.0.0.1"));
+        assert!(!is_private_ip("203.0.113.7"));
+        assert!(!is_private_ip("8.8.8.8"));
     }
 }

@@ -1,6 +1,12 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { Trash2, Download } from 'lucide-react'
 import { storage } from '@/lib/storage'
 
@@ -211,6 +217,9 @@ export function RuntimeLog() {
   const [viewportH, setViewportH] = useState(600)
   const stickBottomRef = useRef(true) // 是否吸附在底部
 
+  // 点击行查看完整内容（虚拟滚动行高固定，无法原地展开，故用弹层显示全文）
+  const [detailLog, setDetailLog] = useState<LogRecord | null>(null)
+
   // 监听容器尺寸
   useEffect(() => {
     const el = scrollRef.current
@@ -341,9 +350,13 @@ export function RuntimeLog() {
                 {visibleRows.map(log => (
                   <div
                     key={log.seq}
-                    className="flex items-center gap-1 overflow-hidden whitespace-nowrap"
+                    role="button"
+                    tabIndex={0}
+                    className="flex items-center gap-1 overflow-hidden whitespace-nowrap cursor-pointer hover:bg-muted/60 rounded focus:outline-none focus:bg-muted/60"
                     style={{ height: ROW_HEIGHT }}
-                    title={`${log.message}${renderFields(log)}`}
+                    title="点击查看完整内容"
+                    onClick={() => setDetailLog(log)}
+                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setDetailLog(log) } }}
                   >
                     <span className="text-muted-foreground shrink-0">{formatTime(log.ts)}</span>
                     <span className={`shrink-0 ${LEVEL_COLORS[log.level] ?? 'text-foreground'}`}>{log.level.padEnd(5)}</span>
@@ -356,6 +369,26 @@ export function RuntimeLog() {
           </div>
         </CardContent>
       </Card>
+
+      <Dialog open={detailLog !== null} onOpenChange={(open) => { if (!open) setDetailLog(null) }}>
+        <DialogContent className="max-w-3xl" aria-describedby={undefined}>
+          <DialogHeader>
+            <DialogTitle>日志详情</DialogTitle>
+          </DialogHeader>
+          {detailLog && (
+            <div className="space-y-3 text-sm">
+              <div className="flex items-center gap-3 font-mono text-xs">
+                <span className="text-muted-foreground">{formatTime(detailLog.ts)}</span>
+                <span className={LEVEL_COLORS[detailLog.level] ?? 'text-foreground'}>{detailLog.level}</span>
+                <span className="text-muted-foreground">{detailLog.target}</span>
+              </div>
+              <div className="font-mono text-xs whitespace-pre-wrap break-all bg-muted/40 rounded-md p-3 max-h-[60vh] overflow-y-auto select-text">
+                {detailLog.message}{renderFields(detailLog)}
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
     </>
   )
 }

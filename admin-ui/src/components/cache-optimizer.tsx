@@ -4,7 +4,7 @@ import { RefreshCw } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { useCacheOptimizer, useSetCacheOptimizer } from '@/hooks/use-cache-optimizer'
-import type { CacheOptimizerConfig, CacheSegment } from '@/types/api'
+import type { CacheOptimizerConfig, CacheSegment, InputScaleSegment } from '@/types/api'
 
 const DEFAULT_CONFIG: CacheOptimizerConfig = {
   enabled: false,
@@ -34,6 +34,14 @@ const DEFAULT_CONFIG: CacheOptimizerConfig = {
   rewriteOnlyWhenPresent: true,
   keepRawBreakdown: true,
   inputRandomMax: 0,
+  probeBypassMaxInputTokens: null,
+  probeBypassStream: false,
+  probeBypassNonStream: false,
+  probeBypassBuffered: false,
+  inputScaleEnabled: false,
+  inputScaleMaxRead: null,
+  inputScaleMaxWrite: null,
+  inputScaleSegments: [],
 }
 
 function simulatePreview(config: CacheOptimizerConfig): { cacheRead: number; cacheWrite: number } {
@@ -89,7 +97,8 @@ export function CacheOptimizer() {
   const [form, setForm] = useState<CacheOptimizerConfig>(DEFAULT_CONFIG)
 
   useEffect(() => {
-    if (data) setForm(data)
+    // 合并默认值兜底：老配置可能缺少新增字段（探活豁免/输入放大）
+    if (data) setForm({ ...DEFAULT_CONFIG, ...data })
   }, [data])
 
   const preview = useMemo(() => simulatePreview(form), [form])
@@ -110,6 +119,29 @@ export function CacheOptimizer() {
       const segments = [...prev[type]] as [CacheSegment, CacheSegment, CacheSegment]
       segments[index] = { ...segments[index], [field]: value }
       return { ...prev, [type]: segments }
+    })
+  }
+
+  const addScaleSegment = () => {
+    setForm(prev => ({
+      ...prev,
+      inputScaleSegments: [
+        ...prev.inputScaleSegments,
+        { min: 0, max: 0, readMultiplier: 1, writeMultiplier: 1 },
+      ],
+    }))
+  }
+  const removeScaleSegment = (index: number) => {
+    setForm(prev => ({
+      ...prev,
+      inputScaleSegments: prev.inputScaleSegments.filter((_, i) => i !== index),
+    }))
+  }
+  const updateScaleSegment = (index: number, field: keyof InputScaleSegment, value: number) => {
+    setForm(prev => {
+      const segments = [...prev.inputScaleSegments]
+      segments[index] = { ...segments[index], [field]: value }
+      return { ...prev, inputScaleSegments: segments }
     })
   }
 
@@ -428,6 +460,110 @@ export function CacheOptimizer() {
                 <p className="text-xs text-muted-foreground">写到响应中方便排查</p>
               </div>
             </label>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* 探活豁免 */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm">探活豁免</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <p className="text-xs text-muted-foreground">
+            渠道探活等小请求：当「请求输入 token」≤ 阈值时，该请求完全不改写、原样真实返回（相当于这条请求关闭模拟缓存）。阈值留空=不启用。判断用请求进来的输入，不是上游返回。
+          </p>
+          <div className="flex items-center gap-3 flex-wrap">
+            <span className="text-sm font-medium">输入阈值(≤)</span>
+            <input
+              type="number"
+              min={0}
+              placeholder="留空=不启用"
+              value={form.probeBypassMaxInputTokens ?? ''}
+              onChange={e => updateField('probeBypassMaxInputTokens', e.target.value === '' ? null : Number(e.target.value))}
+              className="w-40 h-9 rounded-md border border-input bg-background px-3 text-sm"
+            />
+          </div>
+          <div className="flex items-center gap-4 flex-wrap text-sm">
+            <span className="text-muted-foreground">对以下请求类型生效：</span>
+            {([
+              ['probeBypassNonStream', '非流式'],
+              ['probeBypassStream', '流式'],
+              ['probeBypassBuffered', '缓冲流式(/cc)'],
+            ] as const).map(([key, label]) => (
+              <label key={key} className="flex items-center gap-1.5">
+                <input
+                  type="checkbox"
+                  checked={form[key]}
+                  onChange={e => updateField(key, e.target.checked)}
+                />
+                {label}
+              </label>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* 输入放大 */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm">输入放大（按真实输入分档，对读/写缓存乘倍率）</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <p className="text-xs text-muted-foreground">
+            开启后：按「上游返回的真实输入 token」落档，对模拟改写后的读/写缓存分别乘倍率（保护大输入成本）。倍率支持 1 位小数；放大上限留空=不封顶；只对非零值生效（不破坏只读/只写）。仅在模拟缓存开启时生效。
+          </p>
+          <div className="flex items-center gap-4 flex-wrap">
+            <label className="flex items-center gap-1.5 text-sm">
+              <input
+                type="checkbox"
+                checked={form.inputScaleEnabled}
+                onChange={e => updateField('inputScaleEnabled', e.target.checked)}
+              />
+              启用输入放大
+            </label>
+            <span className="text-sm font-medium ml-2">放大后最大读</span>
+            <input
+              type="number" min={0} placeholder="留空=不封顶"
+              value={form.inputScaleMaxRead ?? ''}
+              onChange={e => updateField('inputScaleMaxRead', e.target.value === '' ? null : Number(e.target.value))}
+              className="w-32 h-9 rounded-md border border-input bg-background px-3 text-sm"
+            />
+            <span className="text-sm font-medium">放大后最大写</span>
+            <input
+              type="number" min={0} placeholder="留空=不封顶"
+              value={form.inputScaleMaxWrite ?? ''}
+              onChange={e => updateField('inputScaleMaxWrite', e.target.value === '' ? null : Number(e.target.value))}
+              className="w-32 h-9 rounded-md border border-input bg-background px-3 text-sm"
+            />
+          </div>
+          {/* 分段表 */}
+          <div className="space-y-2">
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <span className="w-28">输入≥</span>
+              <span className="w-28">输入≤</span>
+              <span className="w-24">读倍率</span>
+              <span className="w-24">写倍率</span>
+            </div>
+            {form.inputScaleSegments.map((seg, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <input type="number" min={0} value={seg.min}
+                  onChange={e => updateScaleSegment(i, 'min', Number(e.target.value))}
+                  className="w-28 h-8 rounded-md border border-input bg-background px-2 text-sm" />
+                <input type="number" min={0} value={seg.max}
+                  onChange={e => updateScaleSegment(i, 'max', Number(e.target.value))}
+                  className="w-28 h-8 rounded-md border border-input bg-background px-2 text-sm" />
+                <input type="number" min={0} step={0.1} value={seg.readMultiplier}
+                  onChange={e => updateScaleSegment(i, 'readMultiplier', Number(e.target.value))}
+                  className="w-24 h-8 rounded-md border border-input bg-background px-2 text-sm" />
+                <input type="number" min={0} step={0.1} value={seg.writeMultiplier}
+                  onChange={e => updateScaleSegment(i, 'writeMultiplier', Number(e.target.value))}
+                  className="w-24 h-8 rounded-md border border-input bg-background px-2 text-sm" />
+                <Button variant="ghost" size="sm" className="text-destructive"
+                  onClick={() => removeScaleSegment(i)}>删除</Button>
+              </div>
+            ))}
+            <Button variant="outline" size="sm" onClick={addScaleSegment}>+ 添加分档</Button>
           </div>
         </CardContent>
       </Card>
