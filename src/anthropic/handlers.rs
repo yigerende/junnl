@@ -103,6 +103,8 @@ impl CallLogContext {
             success,
             first_token_ms: None,
             total_duration_ms: None,
+            input_tokens: None,
+            reported_input_tokens: None,
         })
     }
 }
@@ -1081,8 +1083,12 @@ fn create_sse_stream(
                             ));
                             // 回填总耗时（异常结束）
                             call_log.update_timing(log_id, None, Some(req_started.elapsed().as_millis() as u64));
+                            // 回填上游真实输入 token 数（仅上游已返回 tokenUsage 时有值）
+                            call_log.update_input_tokens(log_id, ctx.upstream_input_tokens());
                             // 发送最终事件并结束
                             let final_events = ctx.generate_final_events();
+                            // 回填最终返回给下游的输入 token 数（须在 generate_final_events 之后）
+                            call_log.update_reported_input_tokens(log_id, ctx.reported_input_tokens());
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -1099,8 +1105,12 @@ fn create_sse_stream(
                             ));
                             // 回填总耗时（正常结束）
                             call_log.update_timing(log_id, None, Some(req_started.elapsed().as_millis() as u64));
+                            // 回填上游真实输入 token 数（仅上游已返回 tokenUsage 时有值）
+                            call_log.update_input_tokens(log_id, ctx.upstream_input_tokens());
                             // 流结束，发送最终事件
                             let final_events = ctx.generate_final_events();
+                            // 回填最终返回给下游的输入 token 数（须在 generate_final_events 之后）
+                            call_log.update_reported_input_tokens(log_id, ctx.reported_input_tokens());
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -1465,6 +1475,20 @@ async fn handle_non_stream_request(
         })
     };
 
+    // 回填上游真实输入 token 数（仅上游返回 tokenUsage 时有值）
+    log_ctx
+        .call_log
+        .update_input_tokens(log_id, upstream_input_tokens);
+    // 回填最终返回给下游的输入 token 数（从已构建响应体的 usage.input_tokens 读回，
+    // 无论是否经模拟改写，都是实际发给下游的值）
+    let reported_input_tokens = response_body
+        .get("usage")
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32);
+    log_ctx
+        .call_log
+        .update_reported_input_tokens(log_id, reported_input_tokens);
     // 回填总耗时（非流式：响应体读完、解析与构建完毕）
     log_ctx
         .call_log
@@ -1924,8 +1948,12 @@ fn create_buffered_sse_stream(
                                 ));
                                 // 回填总耗时（异常结束）
                                 call_log.update_timing(log_id, None, Some(req_started.elapsed().as_millis() as u64));
+                                // 回填上游真实输入 token 数（仅上游已返回 tokenUsage 时有值）
+                                call_log.update_input_tokens(log_id, ctx.upstream_input_tokens());
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
+                                // 回填最终返回给下游的输入 token 数（须在 finish_and_get_all_events 之后）
+                                call_log.update_reported_input_tokens(log_id, ctx.reported_input_tokens());
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -1942,8 +1970,12 @@ fn create_buffered_sse_stream(
                                 ));
                                 // 回填总耗时（正常结束）
                                 call_log.update_timing(log_id, None, Some(req_started.elapsed().as_millis() as u64));
+                                // 回填上游真实输入 token 数（仅上游已返回 tokenUsage 时有值）
+                                call_log.update_input_tokens(log_id, ctx.upstream_input_tokens());
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
                                 let all_events = ctx.finish_and_get_all_events();
+                                // 回填最终返回给下游的输入 token 数（须在 finish_and_get_all_events 之后）
+                                call_log.update_reported_input_tokens(log_id, ctx.reported_input_tokens());
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))

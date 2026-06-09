@@ -68,6 +68,15 @@ pub struct CallLogEntry {
     /// 在请求完成后回填；未完成/已被淘汰时为 None。
     #[serde(default)]
     pub total_duration_ms: Option<u64>,
+    /// 输入 token 数：上游 Kiro tokenUsage 返回的真实输入 token（非本地估算）。
+    /// 仅在上游返回 messageMetadataEvent.tokenUsage 时可得，在请求完成后回填；
+    /// 上游未返回或条目已被淘汰时为 None。
+    #[serde(default)]
+    pub input_tokens: Option<i32>,
+    /// 最终返回给下游的输入 token 数：经缓存改写/模拟/放大后，实际写入响应 usage.input_tokens
+    /// 的值（无论是否模拟）。在请求完成后回填；未完成/已被淘汰时为 None。
+    #[serde(default)]
+    pub reported_input_tokens: Option<i32>,
 }
 
 /// 调用日志环形缓冲
@@ -132,6 +141,29 @@ impl CallLog {
         }
     }
 
+    /// 按 ID 回填上游真实输入 token 数。条目可能已被环形缓冲淘汰，此时静默忽略。
+    /// 仅 `Some(_)` 时写入，`None` 保持原值。最新条目在队尾，故从尾部反向查找。
+    pub fn update_input_tokens(&self, id: u64, input_tokens: Option<i32>) {
+        let Some(input_tokens) = input_tokens else {
+            return;
+        };
+        let mut inner = self.inner.write();
+        if let Some(entry) = inner.entries.iter_mut().rev().find(|e| e.id == id) {
+            entry.input_tokens = Some(input_tokens);
+        }
+    }
+
+    /// 按 ID 回填最终返回给下游的输入 token 数。`None` 保持原值，淘汰条目静默忽略。
+    pub fn update_reported_input_tokens(&self, id: u64, reported_input_tokens: Option<i32>) {
+        let Some(reported_input_tokens) = reported_input_tokens else {
+            return;
+        };
+        let mut inner = self.inner.write();
+        if let Some(entry) = inner.entries.iter_mut().rev().find(|e| e.id == id) {
+            entry.reported_input_tokens = Some(reported_input_tokens);
+        }
+    }
+
     /// 获取最近的日志（按时间倒序，最新在前），最多 limit 条
     pub fn recent(&self, limit: usize) -> Vec<CallLogEntry> {
         let inner = self.inner.read();
@@ -189,6 +221,8 @@ mod tests {
             success: true,
             first_token_ms: None,
             total_duration_ms: None,
+            input_tokens: None,
+            reported_input_tokens: None,
         }
     }
 
@@ -259,5 +293,48 @@ mod tests {
         assert_eq!(e1.total_duration_ms, Some(111));
         assert_eq!(e2.first_token_ms, Some(22));
         assert_eq!(e2.total_duration_ms, Some(222));
+    }
+
+    #[test]
+    fn update_input_tokens_backfills_by_id() {
+        let log = CallLog::new(10);
+        let id = log.record(sample_entry());
+        // 初始为 None
+        assert_eq!(log.recent(1)[0].input_tokens, None);
+
+        log.update_input_tokens(id, Some(1234));
+        assert_eq!(log.recent(1)[0].input_tokens, Some(1234));
+
+        // None 不应覆盖已写入的值
+        log.update_input_tokens(id, None);
+        assert_eq!(log.recent(1)[0].input_tokens, Some(1234));
+    }
+
+    #[test]
+    fn update_input_tokens_ignores_evicted_entry() {
+        let log = CallLog::new(2);
+        let id1 = log.record(sample_entry()); // 将被淘汰
+        log.record(sample_entry());
+        log.record(sample_entry()); // 触发淘汰 id1
+
+        // 对已淘汰条目回填应静默忽略，不 panic
+        log.update_input_tokens(id1, Some(999));
+        let recent = log.recent(10);
+        assert_eq!(recent.len(), 2);
+        assert!(recent.iter().all(|e| e.id != id1));
+    }
+
+    #[test]
+    fn update_reported_input_tokens_backfills_by_id() {
+        let log = CallLog::new(10);
+        let id = log.record(sample_entry());
+        assert_eq!(log.recent(1)[0].reported_input_tokens, None);
+
+        log.update_reported_input_tokens(id, Some(4567));
+        assert_eq!(log.recent(1)[0].reported_input_tokens, Some(4567));
+
+        // None 不应覆盖已写入的值
+        log.update_reported_input_tokens(id, None);
+        assert_eq!(log.recent(1)[0].reported_input_tokens, Some(4567));
     }
 }

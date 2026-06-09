@@ -191,4 +191,8 @@ export interface CallLogEntry {
   firstTokenMs?: number | null
   /** 总耗时（毫秒）：请求进入到响应流读完 */
   totalDurationMs?: number | null
+  /** 输入 token 数：上游 Kiro tokenUsage 返回的真实输入 token（非估算），上游未返回时为 null */
+  inputTokens?: number | null
+  /** 最终返回给下游的输入 token 数：经缓存改写/模拟/放大后实际发给下游的值 */
+  reportedInputTokens?: number | null
 }

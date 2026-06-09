@@ -13,13 +13,13 @@ if (-not (Test-Path $pidFile)) {
     return
 }
 
-$pid = Get-Content $pidFile
-$proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+$targetPid = (Get-Content $pidFile).Trim()
+$proc = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
 
 if ($proc -and $proc.Name -eq "kiro-rs") {
-    Stop-Process -Id $pid -Force -Confirm:$false
+    Stop-Process -Id $targetPid -Force -Confirm:$false
     Remove-Item $pidFile -Force
-    Write-Host "[junnl] 已停止 (PID: $pid)" -ForegroundColor Green
+    Write-Host "[junnl] 已停止 (PID: $targetPid)" -ForegroundColor Green
 } else {
     Remove-Item $pidFile -Force
     Write-Host "[junnl] 进程已不存在，已清理 PID 文件" -ForegroundColor Yellow

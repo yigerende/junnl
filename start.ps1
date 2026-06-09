@@ -5,7 +5,7 @@ $exe = Join-Path $root "target\release\kiro-rs.exe"
 $pidFile = Join-Path $root ".junnl.pid"
 
 if (Test-Path $pidFile) {
-    $oldPid = Get-Content $pidFile
+    $oldPid = (Get-Content $pidFile).Trim()
     $proc = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
     if ($proc -and $proc.Name -eq "kiro-rs") {
         Write-Host "[junnl] 已在运行 (PID: $oldPid)" -ForegroundColor Yellow

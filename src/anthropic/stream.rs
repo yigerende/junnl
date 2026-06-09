@@ -547,6 +547,9 @@ pub struct StreamContext {
     pub upstream_output_tokens: Option<i32>,
     /// 是否已收到 Kiro tokenUsage 真实输入统计
     has_upstream_token_usage: bool,
+    /// 最终返回给下游的 input_tokens（经缓存改写/模拟/放大后的值）。
+    /// 在 `generate_final_events` 中计算后回填；未生成最终事件时为 None。
+    reported_input_tokens: Option<i32>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
@@ -605,6 +608,7 @@ impl StreamContext {
             context_input_tokens: None,
             upstream_output_tokens: None,
             has_upstream_token_usage: false,
+            reported_input_tokens: None,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
             tool_name_map,
@@ -742,6 +746,22 @@ impl StreamContext {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// 上游 Kiro tokenUsage 返回的真实输入 token 数。
+    /// 仅在收到 messageMetadataEvent.tokenUsage 时为 `Some`，否则 `None`（不返回本地估算值）。
+    pub fn upstream_input_tokens(&self) -> Option<i32> {
+        if self.has_upstream_token_usage {
+            self.context_input_tokens
+        } else {
+            None
+        }
+    }
+
+    /// 最终返回给下游的 input_tokens（经缓存改写/模拟/放大后的值）。
+    /// 仅在 `generate_final_events` 执行后为 `Some`，否则 `None`。
+    pub fn reported_input_tokens(&self) -> Option<i32> {
+        self.reported_input_tokens
     }
 
     fn apply_token_usage(&mut self, token_usage: &crate::kiro::model::events::TokenUsage) {
@@ -1291,6 +1311,9 @@ impl StreamContext {
         // 生成最终事件
         let final_output_tokens = self.upstream_output_tokens.unwrap_or(self.output_tokens);
 
+        // 记录最终返回给下游的 input_tokens（供调用日志回填）
+        self.reported_input_tokens = Some(reported_input_tokens);
+
         events.extend(self.state_manager.generate_final_events(
             reported_input_tokens,
             final_output_tokens,
@@ -1422,6 +1445,9 @@ pub struct BufferedStreamContext {
     event_buffer: Vec<SseEvent>,
     /// 是否已经生成了初始事件
     initial_events_generated: bool,
+    /// 最终返回给下游的 input_tokens（缓冲模式下统一覆盖 message_start/delta 用的那个值）。
+    /// 在 `finish_and_get_all_events` 中计算后回填；未完成时为 None。
+    reported_input_tokens: Option<i32>,
 }
 
 impl BufferedStreamContext {
@@ -1444,6 +1470,7 @@ impl BufferedStreamContext {
             inner,
             event_buffer: Vec::new(),
             initial_events_generated: false,
+            reported_input_tokens: None,
         }
     }
 
@@ -1474,6 +1501,17 @@ impl BufferedStreamContext {
         // 处理事件并缓冲结果
         let events = self.inner.process_kiro_event(event);
         self.event_buffer.extend(events);
+    }
+
+    /// 上游 Kiro tokenUsage 返回的真实输入 token 数（委托给内部 StreamContext）。
+    pub fn upstream_input_tokens(&self) -> Option<i32> {
+        self.inner.upstream_input_tokens()
+    }
+
+    /// 最终返回给下游的 input_tokens（缓冲模式下覆盖 message_start/delta 用的值）。
+    /// 仅在 `finish_and_get_all_events` 执行后为 `Some`，否则 `None`。
+    pub fn reported_input_tokens(&self) -> Option<i32> {
+        self.reported_input_tokens
     }
 
     /// 完成流处理并返回所有事件
@@ -1560,6 +1598,9 @@ impl BufferedStreamContext {
         } else {
             reported_input_tokens
         };
+
+        // 记录最终返回给下游的 input_tokens（供调用日志回填）
+        self.reported_input_tokens = Some(reported_input_tokens);
 
         // 更正 message_start 事件中的 input_tokens
         for event in &mut self.event_buffer {
