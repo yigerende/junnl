@@ -72,18 +72,21 @@ impl CallLogContext {
     /// 在请求完成后写入一条调用日志。
     /// `provider` 用于查询该凭据的累计请求次数；`credential_id` 为本次实际使用的凭据；
     /// `affinity_hit` 为是否命中会话亲和。
+    ///
+    /// 返回该条目的 ID，供请求完成后通过 `call_log.update_timing` 回填首token/总耗时。
     fn record(
         &self,
         provider: Option<&crate::kiro::provider::KiroProvider>,
         credential_id: Option<u64>,
         affinity_hit: bool,
         success: bool,
-    ) {
+    ) -> u64 {
         let credential_request_count = match (credential_id, provider) {
             (Some(id), Some(p)) => Some(p.get_request_count(id)),
             _ => None,
         };
         self.call_log.record(super::call_log::CallLogEntry {
+            id: 0, // 由 CallLog::record 分配并覆盖
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
             downstream_model: self.downstream_model.clone(),
             upstream_model: self.upstream_model.clone(),
@@ -98,7 +101,9 @@ impl CallLogContext {
             conversation_id_source: self.conversation_id_source.clone(),
             session_affinity_hit: affinity_hit,
             success,
-        });
+            first_token_ms: None,
+            total_duration_ms: None,
+        })
     }
 }
 
@@ -695,6 +700,8 @@ pub async fn post_messages(
     headers: axum::http::HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    // 计时起点：对齐 sub2 的 Forward() 顶部——在请求转换、token 计算等本地预处理之前即开始计时
+    let req_started = std::time::Instant::now();
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
@@ -844,6 +851,7 @@ pub async fn post_messages(
             tool_name_map,
             state.cache_optimizer.clone(),
             log_ctx,
+            req_started,
         )
         .await
     } else {
@@ -862,6 +870,7 @@ pub async fn post_messages(
             tool_name_map,
             state.cache_optimizer.clone(),
             log_ctx,
+            req_started,
         )
         .await
     }
@@ -881,8 +890,9 @@ async fn handle_stream_request(
         parking_lot::RwLock<crate::model::config::CacheOptimizerConfig>,
     >,
     log_ctx: CallLogContext,
+    // 计时起点：在 handler 入口（含请求转换）即开始，对齐 sub2 的 Forward() 顶部
+    req_started: std::time::Instant,
 ) -> Response {
-    let req_started = std::time::Instant::now();
     // 调用 Kiro API（支持多凭据故障转移）
     let api_result = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
@@ -899,7 +909,7 @@ async fn handle_stream_request(
         }
     };
     // 记录调用日志：已选中凭据并连上上游
-    log_ctx.record(
+    let log_id = log_ctx.record(
         Some(provider.as_ref()),
         Some(api_result.credential_id),
         api_result.session_affinity_hit,
@@ -950,8 +960,15 @@ async fn handle_stream_request(
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
-    // 创建 SSE 流
-    let stream = create_sse_stream(api_result.response, ctx, initial_events);
+    // 创建 SSE 流（传入调用日志句柄，流结束后回填首token/总耗时）
+    let stream = create_sse_stream(
+        api_result.response,
+        ctx,
+        initial_events,
+        log_ctx.call_log.clone(),
+        log_id,
+        req_started,
+    );
 
     // 返回 SSE 响应
     Response::builder()
@@ -976,6 +993,9 @@ fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    call_log: super::call_log::CallLog,
+    log_id: u64,
+    req_started: std::time::Instant,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -993,9 +1013,10 @@ fn create_sse_stream(
     let stream_started = std::time::Instant::now();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), false, 0u64),
-        move |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut first_byte_logged, mut ping_count)| {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), false, 0u64, false),
+        move |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut first_byte_logged, mut ping_count, mut first_token_recorded)| {
             let span = span.clone();
+            let call_log = call_log.clone();
             async move {
             if finished {
                 return None;
@@ -1025,6 +1046,12 @@ fn create_sse_stream(
                                 match result {
                                     Ok(frame) => {
                                         if let Ok(event) = Event::from_frame(frame) {
+                                            // 首token：对齐 sub2，在首个上游事件（首个非空 data 负载）
+                                            // 解码成功时回填（相对请求进入时刻）。
+                                            if !first_token_recorded {
+                                                first_token_recorded = true;
+                                                call_log.update_timing(log_id, Some(req_started.elapsed().as_millis() as u64), None);
+                                            }
                                             let sse_events = ctx.process_kiro_event(&event);
                                             events.extend(sse_events);
                                         }
@@ -1041,7 +1068,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, first_byte_logged, ping_count)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, first_byte_logged, ping_count, first_token_recorded)))
                         }
                         Some(Err(e)) => {
                             span.in_scope(|| tracing::error!(
@@ -1052,13 +1079,15 @@ fn create_sse_stream(
                                 error = %e,
                                 "流式读取上游失败"
                             ));
+                            // 回填总耗时（异常结束）
+                            call_log.update_timing(log_id, None, Some(req_started.elapsed().as_millis() as u64));
                             // 发送最终事件并结束
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_byte_logged, ping_count)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_byte_logged, ping_count, first_token_recorded)))
                         }
                         None => {
                             span.in_scope(|| tracing::info!(
@@ -1068,13 +1097,15 @@ fn create_sse_stream(
                                 ping_count = ping_count,
                                 "流式正常结束"
                             ));
+                            // 回填总耗时（正常结束）
+                            call_log.update_timing(log_id, None, Some(req_started.elapsed().as_millis() as u64));
                             // 流结束，发送最终事件
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_byte_logged, ping_count)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_byte_logged, ping_count, first_token_recorded)))
                         }
                     }
                 }
@@ -1083,7 +1114,7 @@ fn create_sse_stream(
                     ping_count += 1;
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, first_byte_logged, ping_count)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, first_byte_logged, ping_count, first_token_recorded)))
                 }
             }
             }
@@ -1110,6 +1141,8 @@ async fn handle_non_stream_request(
         parking_lot::RwLock<crate::model::config::CacheOptimizerConfig>,
     >,
     log_ctx: CallLogContext,
+    // 计时起点：在 handler 入口（含请求转换）即开始，对齐 sub2 的 Forward() 顶部
+    req_started: std::time::Instant,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let api_result = match provider.call_api(request_body).await {
@@ -1121,12 +1154,16 @@ async fn handle_non_stream_request(
         }
     };
     // 记录调用日志：已选中凭据并连上上游
-    log_ctx.record(
+    let log_id = log_ctx.record(
         Some(provider.as_ref()),
         Some(api_result.credential_id),
         api_result.session_affinity_hit,
         true,
     );
+    // 非流式无逐 token 流，以"上游响应就绪"耗时作为首token近似值
+    log_ctx
+        .call_log
+        .update_timing(log_id, Some(req_started.elapsed().as_millis() as u64), None);
     // 并发槽位守卫：显式持有到本函数返回（body 读完、响应构建完毕）后再 drop。
     // 非流式无 stream_end，靠此 binding 的作用域保证槽位不被提前释放。
     let _slot_guard = api_result.slot_guard;
@@ -1428,6 +1465,11 @@ async fn handle_non_stream_request(
         })
     };
 
+    // 回填总耗时（非流式：响应体读完、解析与构建完毕）
+    log_ctx
+        .call_log
+        .update_timing(log_id, None, Some(req_started.elapsed().as_millis() as u64));
+
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
@@ -1514,6 +1556,8 @@ pub async fn post_messages_cc(
     headers: axum::http::HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    // 计时起点：对齐 sub2 的 Forward() 顶部——在请求转换、token 计算等本地预处理之前即开始计时
+    let req_started = std::time::Instant::now();
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
@@ -1664,6 +1708,7 @@ pub async fn post_messages_cc(
             tool_name_map,
             state.cache_optimizer.clone(),
             log_ctx,
+            req_started,
         )
         .await
     } else {
@@ -1682,6 +1727,7 @@ pub async fn post_messages_cc(
             tool_name_map,
             state.cache_optimizer.clone(),
             log_ctx,
+            req_started,
         )
         .await
     }
@@ -1704,6 +1750,8 @@ async fn handle_stream_request_buffered(
         parking_lot::RwLock<crate::model::config::CacheOptimizerConfig>,
     >,
     log_ctx: CallLogContext,
+    // 计时起点：在 handler 入口（含请求转换）即开始，对齐 sub2 的 Forward() 顶部
+    req_started: std::time::Instant,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let api_result = match provider.call_api_stream(request_body).await {
@@ -1713,7 +1761,7 @@ async fn handle_stream_request_buffered(
             return map_provider_error(e, estimated_input_tokens);
         }
     };
-    log_ctx.record(
+    let log_id = log_ctx.record(
         Some(provider.as_ref()),
         Some(api_result.credential_id),
         api_result.session_affinity_hit,
@@ -1755,8 +1803,14 @@ async fn handle_stream_request_buffered(
     // 并发槽位守卫随 BufferedStreamContext 持有到 stream_end 后 drop
     ctx.set_slot_guard(api_result.slot_guard);
 
-    // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(api_result.response, ctx);
+    // 创建缓冲 SSE 流（传入调用日志句柄，流结束后回填首token/总耗时）
+    let stream = create_buffered_sse_stream(
+        api_result.response,
+        ctx,
+        log_ctx.call_log.clone(),
+        log_id,
+        req_started,
+    );
 
     // 返回 SSE 响应
     Response::builder()
@@ -1778,6 +1832,9 @@ async fn handle_stream_request_buffered(
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
+    call_log: super::call_log::CallLog,
+    log_id: u64,
+    req_started: std::time::Instant,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -1794,9 +1851,11 @@ fn create_buffered_sse_stream(
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
             false,
             0u64,
+            false,
         ),
-        move |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut first_byte_logged, mut ping_count)| {
+        move |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut first_byte_logged, mut ping_count, mut first_token_recorded)| {
             let span = span.clone();
+            let call_log = call_log.clone();
             async move {
             if finished {
                 return None;
@@ -1813,7 +1872,7 @@ fn create_buffered_sse_stream(
                         ping_count += 1;
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, first_byte_logged, ping_count)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, first_byte_logged, ping_count, first_token_recorded)));
                     }
 
                     // 然后处理数据流
@@ -1837,6 +1896,12 @@ fn create_buffered_sse_stream(
                                     match result {
                                         Ok(frame) => {
                                             if let Ok(event) = Event::from_frame(frame) {
+                                                // 首token：对齐 sub2，在首个上游事件（首个非空 data 负载）
+                                                // 解码成功时回填（相对请求进入时刻）。
+                                                if !first_token_recorded {
+                                                    first_token_recorded = true;
+                                                    call_log.update_timing(log_id, Some(req_started.elapsed().as_millis() as u64), None);
+                                                }
                                                 // 缓冲事件（复用 StreamContext 的处理逻辑）
                                                 ctx.process_and_buffer(&event);
                                             }
@@ -1857,13 +1922,15 @@ fn create_buffered_sse_stream(
                                     error = %e,
                                     "流式读取上游失败（缓冲模式）"
                                 ));
+                                // 回填总耗时（异常结束）
+                                call_log.update_timing(log_id, None, Some(req_started.elapsed().as_millis() as u64));
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_byte_logged, ping_count)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_byte_logged, ping_count, first_token_recorded)));
                             }
                             None => {
                                 span.in_scope(|| tracing::info!(
@@ -1873,13 +1940,15 @@ fn create_buffered_sse_stream(
                                     ping_count = ping_count,
                                     "流式正常结束（缓冲模式）"
                                 ));
+                                // 回填总耗时（正常结束）
+                                call_log.update_timing(log_id, None, Some(req_started.elapsed().as_millis() as u64));
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_byte_logged, ping_count)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_byte_logged, ping_count, first_token_recorded)));
                             }
                         }
                     }

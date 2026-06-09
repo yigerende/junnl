@@ -187,4 +187,8 @@ export interface CallLogEntry {
   conversationIdSource?: string | null
   sessionAffinityHit?: boolean
   success?: boolean
+  /** 首 token 耗时（毫秒）：请求进入到上游首字节到达 */
+  firstTokenMs?: number | null
+  /** 总耗时（毫秒）：请求进入到响应流读完 */
+  totalDurationMs?: number | null
 }

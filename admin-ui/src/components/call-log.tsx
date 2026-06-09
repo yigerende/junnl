@@ -11,6 +11,13 @@ function formatTime(ms: number): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
 
+// 格式化耗时（毫秒）：<1000 显示 ms，否则显示 s
+function formatDuration(ms?: number | null): string {
+  if (ms == null) return '—'
+  if (ms < 1000) return `${ms}ms`
+  return `${(ms / 1000).toFixed(2)}s`
+}
+
 export function CallLog() {
   const { data, isLoading, refetch } = useCallLogs(5000)
   const { mutate: clearLogs, isPending: isClearing } = useClearCallLogs()
@@ -178,6 +185,8 @@ export function CallLog() {
                     <th className="py-2 px-2 font-medium">上游模型</th>
                     <th className="py-2 px-2 font-medium">映射</th>
                     <th className="py-2 px-2 font-medium">流式</th>
+                    <th className="py-2 px-2 font-medium">首token</th>
+                    <th className="py-2 px-2 font-medium">总耗时</th>
                     <th className="py-2 px-2 font-medium">端点</th>
                     <th className="py-2 px-2 font-medium">会话ID</th>
                     <th className="py-2 px-2 font-medium">结果</th>
@@ -215,6 +224,16 @@ export function CallLog() {
                         {log.stream
                           ? <span className="text-xs text-foreground">流式</span>
                           : <span className="text-xs text-muted-foreground">非流式</span>}
+                      </td>
+                      <td className="py-1.5 px-2 text-xs font-mono whitespace-nowrap">
+                        {log.firstTokenMs != null
+                          ? <span className="text-foreground">{formatDuration(log.firstTokenMs)}</span>
+                          : <span className="text-muted-foreground">—</span>}
+                      </td>
+                      <td className="py-1.5 px-2 text-xs font-mono whitespace-nowrap">
+                        {log.totalDurationMs != null
+                          ? <span className="text-foreground">{formatDuration(log.totalDurationMs)}</span>
+                          : <span className="text-muted-foreground">—</span>}
                       </td>
                       <td className="py-1.5 px-2 font-mono text-xs text-muted-foreground">{log.endpoint}</td>
                       <td className="py-1.5 px-2 text-xs">
