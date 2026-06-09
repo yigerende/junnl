@@ -82,11 +82,19 @@ pub struct RequestContext<'a> {
     pub config: &'a Config,
 }
 
-/// 默认的 MONTHLY_REQUEST_COUNT 判断逻辑
+/// 默认的"额度用尽"判断逻辑（402 时触发禁用凭据 + 故障转移）
 ///
+/// 识别两类需要立即弃用该凭据的额度耗尽信号：
+/// - `MONTHLY_REQUEST_COUNT`：月度请求额度用尽
+/// - `OVERAGE_REQUEST_LIMIT_EXCEEDED`：已开启 overages 且超额额度也已用尽
+///
+/// 两者语义一致——该账号当前已无可用额度，应禁用并切到下一个可用凭据。
 /// 同时识别顶层 `reason` 字段和嵌套 `error.reason` 字段。
 pub fn default_is_monthly_request_limit(body: &str) -> bool {
-    if body.contains("MONTHLY_REQUEST_COUNT") {
+    const EXHAUSTED_REASONS: [&str; 2] =
+        ["MONTHLY_REQUEST_COUNT", "OVERAGE_REQUEST_LIMIT_EXCEEDED"];
+
+    if EXHAUSTED_REASONS.iter().any(|r| body.contains(r)) {
         return true;
     }
 
@@ -94,18 +102,15 @@ pub fn default_is_monthly_request_limit(body: &str) -> bool {
         return false;
     };
 
-    if value
-        .get("reason")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
-    {
+    let reason_matches = |reason: Option<&str>| {
+        reason.is_some_and(|v| EXHAUSTED_REASONS.contains(&v))
+    };
+
+    if reason_matches(value.get("reason").and_then(|v| v.as_str())) {
         return true;
     }
 
-    value
-        .pointer("/error/reason")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
+    reason_matches(value.pointer("/error/reason").and_then(|v| v.as_str()))
 }
 
 /// 默认的 bearer token 失效判断逻辑
@@ -133,6 +138,19 @@ mod tests {
     fn test_default_monthly_request_limit_false() {
         let body = r#"{"message":"nope","reason":"DAILY_REQUEST_COUNT"}"#;
         assert!(!default_is_monthly_request_limit(body));
+    }
+
+    #[test]
+    fn test_overage_request_limit_detected_as_exhausted() {
+        // 开启 overages 且超额也用尽 -> 应识别为额度耗尽，触发禁用+切号
+        let body = r#"{"message":"You have reached the limit for overages.","reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#;
+        assert!(default_is_monthly_request_limit(body));
+    }
+
+    #[test]
+    fn test_overage_request_limit_nested_reason() {
+        let body = r#"{"error":{"reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}}"#;
+        assert!(default_is_monthly_request_limit(body));
     }
 
     #[test]

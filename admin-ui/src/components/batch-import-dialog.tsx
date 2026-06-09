@@ -53,7 +53,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
 
-  const { data: existingCredentials } = useCredentials()
+  // 仅用于导入去重判断，不需要自动轮询（传 0 关闭，避免压低 dashboard 的刷新间隔设置）
+  const { data: existingCredentials } = useCredentials(0)
   const { mutateAsync: addCredential } = useAddCredential()
   const { mutateAsync: deleteCredential } = useDeleteCredential()
 
