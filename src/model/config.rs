@@ -289,6 +289,30 @@ impl ModelMappingConfig {
     }
 }
 
+/// 代理池中的单个代理配置。
+///
+/// `protocol` 只允许 http / https / socks5；运行时会用 id 被凭据引用。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyProfile {
+    pub id: u64,
+
+    #[serde(default)]
+    pub name: String,
+
+    pub protocol: String,
+    pub host: String,
+    pub port: u16,
+
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -397,6 +421,10 @@ pub struct Config {
     #[serde(default)]
     pub model_mapping: ModelMappingConfig,
 
+    /// Admin 管理的代理池配置
+    #[serde(default)]
+    pub proxies: Vec<ProxyProfile>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -484,6 +512,7 @@ impl Default for Config {
             endpoints: HashMap::new(),
             cache_optimizer: CacheOptimizerConfig::default(),
             model_mapping: ModelMappingConfig::default(),
+            proxies: Vec::new(),
             config_path: None,
         }
     }

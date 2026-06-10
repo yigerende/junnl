@@ -8,6 +8,10 @@ import type {
   SetPriorityRequest,
   SetConcurrencyRequest,
   BatchSetConcurrencyRequest,
+  SetCredentialProxiesRequest,
+  BatchSetCredentialProxiesRequest,
+  ProxyProfile,
+  ProxyConnectivityResult,
   AddCredentialRequest,
   AddCredentialResponse,
   CacheOptimizerConfig,
@@ -90,6 +94,60 @@ export async function batchSetConcurrency(
   const { data } = await api.post<SuccessResponse>(
     `/credentials/concurrency/batch`,
     { ids, maxConcurrency } as BatchSetConcurrencyRequest
+  )
+  return data
+}
+
+// 获取代理池列表
+export async function getProxies(): Promise<ProxyProfile[]> {
+  const { data } = await api.get<{ proxies: ProxyProfile[] }>('/proxies')
+  return data.proxies
+}
+
+// 新增代理
+export async function createProxy(req: Omit<ProxyProfile, 'id'>): Promise<ProxyProfile> {
+  const { data } = await api.post<ProxyProfile>('/proxies', { id: 0, ...req })
+  return data
+}
+
+// 更新代理
+export async function updateProxy(id: number, req: Omit<ProxyProfile, 'id'>): Promise<ProxyProfile> {
+  const { data } = await api.put<ProxyProfile>(`/proxies/${id}`, { id, ...req })
+  return data
+}
+
+// 删除代理
+export async function deleteProxy(id: number): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>(`/proxies/${id}`)
+  return data
+}
+
+// 测试代理连接
+export async function testProxy(id: number): Promise<ProxyConnectivityResult> {
+  const { data } = await api.post<ProxyConnectivityResult>(`/proxies/${id}/test`)
+  return data
+}
+
+// 设置单个凭据的代理优先级列表
+export async function setCredentialProxies(
+  id: number,
+  proxyIds: number[]
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/proxies`,
+    { proxyIds } as SetCredentialProxiesRequest
+  )
+  return data
+}
+
+// 批量设置凭据的代理优先级列表
+export async function batchSetCredentialProxies(
+  ids: number[],
+  proxyIds: number[]
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/proxies/batch`,
+    { ids, proxyIds } as BatchSetCredentialProxiesRequest
   )
   return data
 }

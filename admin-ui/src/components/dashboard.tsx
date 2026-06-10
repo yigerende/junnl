@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, AlertTriangle, Ban, Activity, Wallet, DollarSign, Gauge } from 'lucide-react'
+import { RefreshCw, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, AlertTriangle, Ban, Activity, Wallet, DollarSign, Gauge, Network } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -12,7 +12,8 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useBatchSetConcurrency } from '@/hooks/use-credentials'
+import { ProxySelectorDialog } from '@/components/proxy-selector-dialog'
+import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useBatchSetConcurrency, useProxies, useBatchSetCredentialProxies } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken, getCachedBalances } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import { storage } from '@/lib/storage'
@@ -26,6 +27,7 @@ export function Dashboard({}: DashboardProps) {
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
+  const [batchProxyDialogOpen, setBatchProxyDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
@@ -50,6 +52,8 @@ export function Dashboard({}: DashboardProps) {
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const { mutateAsync: batchSetConcurrencyAsync, isPending: isSettingConcurrency } = useBatchSetConcurrency()
+  const { data: proxies = [] } = useProxies()
+  const { mutateAsync: batchSetCredentialProxiesAsync, isPending: isSettingProxies } = useBatchSetCredentialProxies()
 
   // 计算分页
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
@@ -256,6 +260,24 @@ export function Dashboard({}: DashboardProps) {
       refetch()
     } catch (err) {
       toast.error('批量设置失败: ' + extractErrorMessage(err))
+    }
+  }
+
+  const handleBatchSaveProxies = async (proxyIds: number[]) => {
+    if (selectedIds.size === 0) {
+      toast.error('请先选择要设置的凭据')
+      return
+    }
+    try {
+      const res = await batchSetCredentialProxiesAsync({
+        ids: Array.from(selectedIds),
+        proxyIds,
+      })
+      toast.success(res.message)
+      setBatchProxyDialogOpen(false)
+      refetch()
+    } catch (err) {
+      toast.error('批量设置代理失败: ' + extractErrorMessage(err))
     }
   }
 
@@ -831,6 +853,15 @@ export function Dashboard({}: DashboardProps) {
                     批量设置并发
                   </Button>
                   <Button
+                    onClick={() => setBatchProxyDialogOpen(true)}
+                    size="sm"
+                    variant="outline"
+                    disabled={isSettingProxies}
+                  >
+                    <Network className="h-4 w-4 mr-2" />
+                    批量设置代理
+                  </Button>
+                  <Button
                     onClick={handleBatchDelete}
                     size="sm"
                     variant="destructive"
@@ -904,6 +935,7 @@ export function Dashboard({}: DashboardProps) {
                     onToggleSelect={() => toggleSelect(credential.id)}
                     balance={balanceMap.get(credential.id) || null}
                     loadingBalance={loadingBalanceIds.has(credential.id)}
+                    proxies={proxies}
                     onBalanceUpdate={(b) =>
                       setBalanceMap((prev) => {
                         const next = new Map(prev)
@@ -975,6 +1007,16 @@ export function Dashboard({}: DashboardProps) {
         progress={verifyProgress}
         results={verifyResults}
         onCancel={handleCancelVerify}
+      />
+
+      <ProxySelectorDialog
+        open={batchProxyDialogOpen}
+        title={`批量设置 ${selectedIds.size} 个凭据的代理`}
+        proxies={proxies}
+        initialProxyIds={[]}
+        saving={isSettingProxies}
+        onOpenChange={setBatchProxyDialogOpen}
+        onSave={handleBatchSaveProxies}
       />
     </>
   )

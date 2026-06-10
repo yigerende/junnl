@@ -24,7 +24,7 @@ use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::model::config::Config;
+use crate::model::config::{Config, ProxyProfile};
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -62,6 +62,46 @@ fn mask_api_key(key: &str) -> String {
     } else {
         "***".to_string()
     }
+}
+
+fn normalize_proxy_profile_ids(proxies: &mut [ProxyProfile], changed: &mut bool) {
+    let mut max_id = proxies.iter().map(|p| p.id).max().unwrap_or(0);
+    for proxy in proxies {
+        if proxy.id == 0 {
+            max_id += 1;
+            proxy.id = max_id;
+            *changed = true;
+        }
+    }
+}
+
+fn validate_proxy_profile(profile: &ProxyProfile) -> anyhow::Result<()> {
+    let protocol = profile.protocol.trim().to_ascii_lowercase();
+    if !matches!(protocol.as_str(), "http" | "https" | "socks5") {
+        anyhow::bail!("代理协议必须是 HTTP、HTTPS 或 SOCKS5");
+    }
+    if profile.host.trim().is_empty() {
+        anyhow::bail!("代理主机不能为空");
+    }
+    if profile.port == 0 {
+        anyhow::bail!("代理端口必须在 1-65535 之间");
+    }
+    Ok(())
+}
+
+fn proxy_profile_to_config(profile: &ProxyProfile) -> ProxyConfig {
+    let mut proxy = ProxyConfig::new(format!(
+        "{}://{}:{}",
+        profile.protocol.trim().to_ascii_lowercase(),
+        profile.host.trim(),
+        profile.port
+    ));
+    let username = profile.username.as_deref().unwrap_or("").trim();
+    let password = profile.password.as_deref().unwrap_or("").trim();
+    if !username.is_empty() || !password.is_empty() {
+        proxy = proxy.with_auth(username, password);
+    }
+    proxy
 }
 
 /// 验证 refreshToken 的基本有效性
@@ -568,6 +608,9 @@ pub struct CredentialEntrySnapshot {
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 代理池代理 ID 列表，按优先级从高到低排列
+    #[serde(default)]
+    pub proxy_ids: Vec<u64>,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
     /// 禁用原因
@@ -598,6 +641,18 @@ pub struct ManagerSnapshot {
     pub available: usize,
 }
 
+/// 代理连通性测试结果
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyConnectivityResult {
+    pub success: bool,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_address: Option<String>,
+}
+
 /// 多凭据 Token 管理器
 ///
 /// 支持多个凭据的管理，实现固定优先级 + 故障转移策略
@@ -619,6 +674,8 @@ pub struct MultiTokenManager {
     load_balancing_mode: Mutex<String>,
     /// balanced 模式下的会话到凭据绑定，避免同一对话在账号之间来回漂移
     session_affinity: Mutex<HashMap<String, SessionAffinityEntry>>,
+    /// Admin 管理的代理池（运行时可热更新，持久化到 config.json）
+    proxy_profiles: Mutex<Vec<ProxyProfile>>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -754,6 +811,10 @@ impl MultiTokenManager {
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
     ) -> anyhow::Result<Self> {
+        let mut proxy_profiles = config.proxies.clone();
+        let mut has_new_proxy_ids = false;
+        normalize_proxy_profile_ids(&mut proxy_profiles, &mut has_new_proxy_ids);
+
         // 计算当前最大 ID，为没有 ID 的凭据分配新 ID
         let max_existing_id = credentials.iter().filter_map(|c| c.id).max().unwrap_or(0);
         let mut next_id = max_existing_id + 1;
@@ -848,10 +909,17 @@ impl MultiTokenManager {
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
             session_affinity: Mutex::new(HashMap::new()),
+            proxy_profiles: Mutex::new(proxy_profiles),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             self_weak: Mutex::new(Weak::new()),
         };
+
+        if has_new_proxy_ids {
+            if let Err(e) = manager.persist_proxy_profiles() {
+                tracing::warn!("补全代理 ID 后持久化失败: {}", e);
+            }
+        }
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
         if has_new_ids || has_new_machine_ids {
@@ -1454,9 +1522,7 @@ impl MultiTokenManager {
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
-                let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
-                let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                let new_creds = self.refresh_token_with_proxy_fallback(&current_creds).await?;
 
                 if is_token_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
@@ -1558,6 +1624,131 @@ impl MultiTokenManager {
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
         Ok(true)
+    }
+
+    fn persist_proxy_profiles(&self) -> anyhow::Result<bool> {
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => return Ok(false),
+        };
+
+        let proxies = self.proxy_profiles.lock().clone();
+        let mut config = Config::load(&config_path)?;
+        config.proxies = proxies;
+        config.save()?;
+        Ok(true)
+    }
+
+    pub fn effective_proxy_for(&self, credentials: &KiroCredentials) -> Option<ProxyConfig> {
+        self.proxy_candidates_for(credentials)
+            .into_iter()
+            .next()
+            .flatten()
+    }
+
+    pub fn proxy_candidates_for(&self, credentials: &KiroCredentials) -> Vec<Option<ProxyConfig>> {
+        let mut candidates = Vec::new();
+
+        if !credentials.proxy_ids.is_empty() {
+            let profiles = self.proxy_profiles.lock();
+            for id in &credentials.proxy_ids {
+                if let Some(profile) = profiles.iter().find(|p| p.id == *id) {
+                    candidates.push(Some(proxy_profile_to_config(profile)));
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            candidates.push(credentials.effective_proxy(self.proxy.as_ref()));
+        }
+
+        candidates
+    }
+
+    async fn refresh_token_with_proxy_fallback(
+        &self,
+        credentials: &KiroCredentials,
+    ) -> anyhow::Result<KiroCredentials> {
+        let candidates = self.proxy_candidates_for(credentials);
+        let mut last_error = None;
+
+        for (index, proxy) in candidates.iter().enumerate() {
+            match refresh_token(credentials, &self.config, proxy.as_ref()).await {
+                Ok(new_creds) => return Ok(new_creds),
+                Err(e) => {
+                    tracing::warn!(
+                        "Token 刷新失败（代理 {}/{}）: {}",
+                        index + 1,
+                        candidates.len(),
+                        e
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Token 刷新失败：无可用代理")))
+    }
+
+    async fn get_usage_limits_with_proxy_fallback(
+        &self,
+        credentials: &KiroCredentials,
+        token: &str,
+    ) -> anyhow::Result<UsageLimitsResponse> {
+        let candidates = self.proxy_candidates_for(credentials);
+        let mut last_error = None;
+
+        for (index, proxy) in candidates.iter().enumerate() {
+            match get_usage_limits(credentials, &self.config, token, proxy.as_ref()).await {
+                Ok(usage_limits) => return Ok(usage_limits),
+                Err(e) => {
+                    tracing::warn!(
+                        "额度查询失败（代理 {}/{}）: {}",
+                        index + 1,
+                        candidates.len(),
+                        e
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("额度查询失败：无可用代理")))
+    }
+
+    async fn set_user_preference_with_proxy_fallback(
+        &self,
+        credentials: &KiroCredentials,
+        token: &str,
+        overage_status: &str,
+    ) -> anyhow::Result<()> {
+        let candidates = self.proxy_candidates_for(credentials);
+        let mut last_error = None;
+
+        for (index, proxy) in candidates.iter().enumerate() {
+            match set_user_preference(
+                credentials,
+                &self.config,
+                token,
+                proxy.as_ref(),
+                overage_status,
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(
+                        "超额开关设置失败（代理 {}/{}）: {}",
+                        index + 1,
+                        candidates.len(),
+                        e
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("超额开关设置失败：无可用代理")))
     }
 
     /// 获取缓存目录（凭据文件所在目录）
@@ -2004,8 +2195,10 @@ impl MultiTokenManager {
                     success_count: e.success_count,
                     request_count: e.request_count,
                     last_used_at: e.last_used_at.clone(),
-                    has_proxy: e.credentials.proxy_url.is_some(),
+                    has_proxy: e.credentials.proxy_url.is_some()
+                        || !e.credentials.proxy_ids.is_empty(),
                     proxy_url: e.credentials.proxy_url.clone(),
+                    proxy_ids: e.credentials.proxy_ids.clone(),
                     refresh_failure_count: e.refresh_failure_count,
                     disabled_reason: e.disabled_reason.map(|r| {
                         match r {
@@ -2117,6 +2310,265 @@ impl MultiTokenManager {
         Ok(applied)
     }
 
+    pub fn list_proxy_profiles(&self) -> Vec<ProxyProfile> {
+        let mut proxies = self.proxy_profiles.lock().clone();
+        proxies.sort_by_key(|p| p.id);
+        proxies
+    }
+
+    pub fn create_proxy_profile(&self, mut profile: ProxyProfile) -> anyhow::Result<ProxyProfile> {
+        profile.protocol = profile.protocol.trim().to_ascii_lowercase();
+        profile.host = profile.host.trim().to_string();
+        profile.name = profile.name.trim().to_string();
+        profile.username = profile
+            .username
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        profile.password = profile
+            .password
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        validate_proxy_profile(&profile)?;
+        if profile.name.is_empty() {
+            profile.name = format!("{}:{}", profile.host, profile.port);
+        }
+
+        {
+            let mut proxies = self.proxy_profiles.lock();
+            let next_id = proxies.iter().map(|p| p.id).max().unwrap_or(0) + 1;
+            profile.id = next_id;
+            proxies.push(profile.clone());
+        }
+        self.persist_proxy_profiles()?;
+        Ok(profile)
+    }
+
+    pub fn update_proxy_profile(
+        &self,
+        id: u64,
+        mut profile: ProxyProfile,
+    ) -> anyhow::Result<ProxyProfile> {
+        profile.id = id;
+        profile.protocol = profile.protocol.trim().to_ascii_lowercase();
+        profile.host = profile.host.trim().to_string();
+        profile.name = profile.name.trim().to_string();
+        profile.username = profile
+            .username
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        profile.password = profile
+            .password
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        validate_proxy_profile(&profile)?;
+        if profile.name.is_empty() {
+            profile.name = format!("{}:{}", profile.host, profile.port);
+        }
+
+        {
+            let mut proxies = self.proxy_profiles.lock();
+            let existing = proxies
+                .iter_mut()
+                .find(|p| p.id == id)
+                .ok_or_else(|| anyhow::anyhow!("代理不存在: {}", id))?;
+            *existing = profile.clone();
+        }
+        self.persist_proxy_profiles()?;
+        Ok(profile)
+    }
+
+    pub fn delete_proxy_profile(&self, id: u64) -> anyhow::Result<()> {
+        {
+            let entries = self.entries.lock();
+            if entries
+                .iter()
+                .any(|entry| entry.credentials.proxy_ids.contains(&id))
+            {
+                anyhow::bail!("代理正在被凭据使用，请先从凭据代理列表中移除");
+            }
+        }
+
+        {
+            let mut proxies = self.proxy_profiles.lock();
+            let before = proxies.len();
+            proxies.retain(|p| p.id != id);
+            if proxies.len() == before {
+                anyhow::bail!("代理不存在: {}", id);
+            }
+        }
+        self.persist_proxy_profiles()?;
+        Ok(())
+    }
+
+    pub async fn test_proxy_profile(&self, id: u64) -> ProxyConnectivityResult {
+        let profile = {
+            let proxies = self.proxy_profiles.lock();
+            proxies.iter().find(|p| p.id == id).cloned()
+        };
+        let Some(profile) = profile else {
+            return ProxyConnectivityResult {
+                success: false,
+                message: format!("代理不存在: {}", id),
+                latency_ms: None,
+                ip_address: None,
+            };
+        };
+
+        let proxy = proxy_profile_to_config(&profile);
+        let client = match build_client(Some(&proxy), 15, self.config.tls_backend) {
+            Ok(client) => client,
+            Err(e) => {
+                return ProxyConnectivityResult {
+                    success: false,
+                    message: format!("创建代理客户端失败: {}", e),
+                    latency_ms: None,
+                    ip_address: None,
+                };
+            }
+        };
+
+        let started = Instant::now();
+        let response = client
+            .get("https://api.ipify.org")
+            .query(&[("format", "json")])
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                let latency_ms = started.elapsed().as_millis();
+                let value = resp.json::<serde_json::Value>().await.unwrap_or_default();
+                ProxyConnectivityResult {
+                    success: true,
+                    message: "代理连接正常".to_string(),
+                    latency_ms: Some(latency_ms),
+                    ip_address: value
+                        .get("ip")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                }
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                let detail = body.trim();
+                let message = if detail.is_empty() {
+                    format!("测试请求失败: HTTP {}", status)
+                } else {
+                    let detail = detail.chars().take(240).collect::<String>();
+                    format!("测试请求失败: HTTP {} - {}", status, detail)
+                };
+                ProxyConnectivityResult {
+                    success: false,
+                    message,
+                    latency_ms: Some(started.elapsed().as_millis()),
+                    ip_address: None,
+                }
+            }
+            Err(e) => {
+                let https_error = e.to_string();
+                let http_probe = client
+                    .get("http://api.ipify.org")
+                    .query(&[("format", "json")])
+                    .send()
+                    .await;
+
+                let message = match http_probe {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_default();
+                        let detail = body.trim();
+                        if detail.is_empty() {
+                            format!(
+                                "HTTPS 测试失败: {}; HTTP 诊断返回: HTTP {}",
+                                https_error, status
+                            )
+                        } else {
+                            let detail = detail.chars().take(240).collect::<String>();
+                            format!(
+                                "HTTPS 测试失败: {}; HTTP 诊断返回: HTTP {} - {}",
+                                https_error, status, detail
+                            )
+                        }
+                    }
+                    Err(http_error) => format!(
+                        "测试请求失败: {}; HTTP 诊断也失败: {}",
+                        https_error, http_error
+                    ),
+                };
+
+                ProxyConnectivityResult {
+                    success: false,
+                    message,
+                    latency_ms: Some(started.elapsed().as_millis()),
+                    ip_address: None,
+                }
+            }
+        }
+    }
+
+    pub fn set_credential_proxy_ids(&self, id: u64, proxy_ids: Vec<u64>) -> anyhow::Result<()> {
+        let cleaned = self.validate_and_clean_proxy_ids(proxy_ids)?;
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.proxy_ids = cleaned;
+            if !entry.credentials.proxy_ids.is_empty() {
+                entry.credentials.proxy_url = None;
+                entry.credentials.proxy_username = None;
+                entry.credentials.proxy_password = None;
+            }
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    pub fn set_credential_proxy_ids_batch(
+        &self,
+        ids: &[u64],
+        proxy_ids: Vec<u64>,
+    ) -> anyhow::Result<usize> {
+        let cleaned = self.validate_and_clean_proxy_ids(proxy_ids)?;
+        let mut applied = 0usize;
+        {
+            let mut entries = self.entries.lock();
+            for entry in entries.iter_mut() {
+                if ids.contains(&entry.id) {
+                    entry.credentials.proxy_ids = cleaned.clone();
+                    if !entry.credentials.proxy_ids.is_empty() {
+                        entry.credentials.proxy_url = None;
+                        entry.credentials.proxy_username = None;
+                        entry.credentials.proxy_password = None;
+                    }
+                    applied += 1;
+                }
+            }
+        }
+        if applied > 0 {
+            self.persist_credentials()?;
+        }
+        Ok(applied)
+    }
+
+    fn validate_and_clean_proxy_ids(&self, proxy_ids: Vec<u64>) -> anyhow::Result<Vec<u64>> {
+        let known: std::collections::HashSet<u64> =
+            self.proxy_profiles.lock().iter().map(|p| p.id).collect();
+        let mut cleaned = Vec::new();
+        for id in proxy_ids {
+            if id == 0 || cleaned.contains(&id) {
+                continue;
+            }
+            if !known.contains(&id) {
+                anyhow::bail!("代理不存在: {}", id);
+            }
+            cleaned.push(id);
+        }
+        Ok(cleaned)
+    }
+
     /// 重置凭据失败计数并重新启用（Admin API）
     pub fn reset_and_enable(&self, id: u64) -> anyhow::Result<()> {
         {
@@ -2172,10 +2624,7 @@ impl MultiTokenManager {
                 };
 
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                    let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
-                    let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
-                            .await?;
+                    let new_creds = self.refresh_token_with_proxy_fallback(&current_creds).await?;
                     {
                         let mut entries = self.entries.lock();
                         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -2210,9 +2659,9 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits =
-            get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let usage_limits = self
+            .get_usage_limits_with_proxy_fallback(&credentials, &token)
+            .await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -2285,21 +2734,15 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
         };
 
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        set_user_preference(
-            &credentials,
-            &self.config,
-            &token,
-            effective_proxy.as_ref(),
-            overage_status,
-        )
-        .await?;
+        self.set_user_preference_with_proxy_fallback(&credentials, &token, overage_status)
+            .await?;
 
         tracing::info!("凭据 #{} 超额开关已设置为 {}", id, overage_status);
 
         // 重新拉取一次，返回上游确认后的最新状态。
-        let usage_limits =
-            get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let usage_limits = self
+            .get_usage_limits_with_proxy_fallback(&credentials, &token)
+            .await?;
         Ok(usage_limits)
     }
 
@@ -2387,8 +2830,7 @@ impl MultiTokenManager {
         let mut validated_cred = if new_cred.is_api_key_credential() {
             new_cred.clone()
         } else {
-            let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
-            refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
+            self.refresh_token_with_proxy_fallback(&new_cred).await?
         };
 
         // 4. 分配新 ID
@@ -2418,6 +2860,7 @@ impl MultiTokenManager {
         validated_cred.proxy_url = new_cred.proxy_url;
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
+        validated_cred.proxy_ids = new_cred.proxy_ids;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
 
         {
@@ -2529,8 +2972,7 @@ impl MultiTokenManager {
         let _guard = self.refresh_lock.lock().await;
 
         // 无条件调用 refresh_token
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let new_creds = refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+        let new_creds = self.refresh_token_with_proxy_fallback(&credentials).await?;
 
         // 更新 entries 中对应凭据
         {
@@ -3669,14 +4111,10 @@ mod tests {
         // 先制造 2 个在等的请求（它们会卡在 wait_for_sticky 轮询里，把 waiting 抬到 2）
         let m1 = manager.clone();
         let s1 = session.to_string();
-        let w1 = tokio::spawn(async move {
-            m1.acquire_context_for_session(None, Some(&s1)).await
-        });
+        let w1 = tokio::spawn(async move { m1.acquire_context_for_session(None, Some(&s1)).await });
         let m2 = manager.clone();
         let s2 = session.to_string();
-        let w2 = tokio::spawn(async move {
-            m2.acquire_context_for_session(None, Some(&s2)).await
-        });
+        let w2 = tokio::spawn(async move { m2.acquire_context_for_session(None, Some(&s2)).await });
 
         // 等到 waiting 抬到 2（阈值）
         let mut waited_up = false;

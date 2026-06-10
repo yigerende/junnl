@@ -57,6 +57,9 @@ pub struct CredentialStatusItem {
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 代理池代理 ID 列表，按优先级从高到低排列
+    #[serde(default)]
+    pub proxy_ids: Vec<u64>,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
     /// 禁用原因
@@ -158,6 +161,10 @@ pub struct AddCredentialRequest {
     /// 凭据级代理认证密码（可选）
     pub proxy_password: Option<String>,
 
+    /// 代理池代理 ID 列表，按优先级从高到低排列
+    #[serde(default)]
+    pub proxy_ids: Vec<u64>,
+
     /// Kiro API Key（API Key 凭据必填，格式: ksk_xxxxxxxx）
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -187,6 +194,23 @@ pub struct AddCredentialResponse {
     /// 用户邮箱（如果获取成功）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+}
+
+// ============ 代理池 ============
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialProxiesRequest {
+    #[serde(default)]
+    pub proxy_ids: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSetCredentialProxiesRequest {
+    pub ids: Vec<u64>,
+    #[serde(default)]
+    pub proxy_ids: Vec<u64>,
 }
 
 // ============ 余额查询 ============

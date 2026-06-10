@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Zap, ShieldCheck } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Zap, ShieldCheck, Network } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -17,7 +17,9 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
+import type { ProxyProfile } from '@/types/api'
 import { getCredentialBalance } from '@/api/credentials'
+import { ProxySelectorDialog } from '@/components/proxy-selector-dialog'
 import {
   useSetDisabled,
   useSetPriority,
@@ -26,6 +28,7 @@ import {
   useDeleteCredential,
   useForceRefreshToken,
   useSetOverage,
+  useSetCredentialProxies,
 } from '@/hooks/use-credentials'
 
 interface CredentialCardProps {
@@ -35,6 +38,7 @@ interface CredentialCardProps {
   onToggleSelect: () => void
   balance: BalanceResponse | null
   loadingBalance: boolean
+  proxies: ProxyProfile[]
   onBalanceUpdate?: (balance: BalanceResponse) => void
 }
 
@@ -61,6 +65,7 @@ export function CredentialCard({
   onToggleSelect,
   balance,
   loadingBalance,
+  proxies,
   onBalanceUpdate,
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
@@ -70,6 +75,7 @@ export function CredentialCard({
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   const [confirmingOverage, setConfirmingOverage] = useState(false)
   const [testingAlive, setTestingAlive] = useState(false)
+  const [proxyDialogOpen, setProxyDialogOpen] = useState(false)
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
@@ -78,6 +84,11 @@ export function CredentialCard({
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
   const setOverage = useSetOverage()
+  const setCredentialProxies = useSetCredentialProxies()
+
+  const selectedProxies = credential.proxyIds
+    .map(id => proxies.find(proxy => proxy.id === id))
+    .filter((proxy): proxy is ProxyProfile => Boolean(proxy))
 
   const handleToggleOverage = () => {
     if (!balance) return
@@ -202,6 +213,21 @@ export function CredentialCard({
         toast.error('删除失败: ' + (err as Error).message)
       },
     })
+  }
+
+  const handleSaveProxies = (proxyIds: number[]) => {
+    setCredentialProxies.mutate(
+      { id: credential.id, proxyIds },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setProxyDialogOpen(false)
+        },
+        onError: (err) => {
+          toast.error('代理设置失败: ' + (err as Error).message)
+        },
+      }
+    )
   }
 
   return (
@@ -439,7 +465,11 @@ export function CredentialCard({
             {credential.hasProxy && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">代理：</span>
-                <span className="font-medium">{credential.proxyUrl}</span>
+                <span className="font-medium">
+                  {selectedProxies.length > 0
+                    ? selectedProxies.map(proxy => proxy.name || `代理 #${proxy.id}`).join(' → ')
+                    : credential.proxyUrl}
+                </span>
               </div>
             )}
             {credential.hasProfileArn && (
@@ -526,6 +556,14 @@ export function CredentialCard({
                 <ShieldCheck className="h-4 w-4 mr-1" />
               )}
               单独测活
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setProxyDialogOpen(true)}
+            >
+              <Network className="h-4 w-4 mr-1" />
+              设置代理
             </Button>
             {balance && balance.overageStatus !== 'UNKNOWN' && (
               <Button
@@ -615,6 +653,16 @@ export function CredentialCard({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <ProxySelectorDialog
+        open={proxyDialogOpen}
+        title={`设置凭据 #${credential.id} 代理`}
+        proxies={proxies}
+        initialProxyIds={credential.proxyIds || []}
+        saving={setCredentialProxies.isPending}
+        onOpenChange={setProxyDialogOpen}
+        onSave={handleSaveProxies}
+      />
     </>
   )
 }

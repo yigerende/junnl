@@ -35,6 +35,10 @@ interface KamAccount {
     startUrl?: string
   }
   machineId?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+  proxyIds?: number[]
   status?: string
 }
 
@@ -68,6 +72,10 @@ function normalizeKamAccount(item: unknown): unknown {
           : undefined
     const status = typeof obj.status === 'string' ? obj.status : undefined
     const machineId = typeof obj.machineId === 'string' ? obj.machineId : undefined
+    const proxyUrl = typeof obj.proxyUrl === 'string' ? obj.proxyUrl : undefined
+    const proxyUsername = typeof obj.proxyUsername === 'string' ? obj.proxyUsername : undefined
+    const proxyPassword = typeof obj.proxyPassword === 'string' ? obj.proxyPassword : undefined
+    const proxyIds = Array.isArray(obj.proxyIds) ? obj.proxyIds.filter((v): v is number => typeof v === 'number') : undefined
     const clientId = typeof obj.clientId === 'string' ? obj.clientId : undefined
     const clientSecret = typeof obj.clientSecret === 'string' ? obj.clientSecret : undefined
     const region = typeof obj.region === 'string' ? obj.region : undefined
@@ -89,6 +97,10 @@ function normalizeKamAccount(item: unknown): unknown {
       provider,
       status,
       machineId,
+      proxyUrl,
+      proxyUsername,
+      proxyPassword,
+      proxyIds,
       credentials: {
         refreshToken: obj.refreshToken,
         clientId,
@@ -296,6 +308,10 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             clientId,
             clientSecret,
             machineId: account.machineId?.trim() || undefined,
+            proxyUrl: account.proxyUrl?.trim() || undefined,
+            proxyUsername: account.proxyUsername?.trim() || undefined,
+            proxyPassword: account.proxyPassword?.trim() || undefined,
+            proxyIds: Array.isArray(account.proxyIds) ? account.proxyIds : undefined,
           })
 
           addedCredId = addedCred.credentialId

@@ -78,6 +78,7 @@ impl CallLogContext {
         &self,
         provider: Option<&crate::kiro::provider::KiroProvider>,
         credential_id: Option<u64>,
+        proxy_host: Option<String>,
         affinity_hit: bool,
         success: bool,
     ) -> u64 {
@@ -96,6 +97,7 @@ impl CallLogContext {
             client_ip: self.client_ip.clone(),
             client_host: self.client_host.clone(),
             credential_id,
+            proxy_host,
             credential_request_count,
             conversation_id: self.conversation_id.clone(),
             conversation_id_source: self.conversation_id_source.clone(),
@@ -776,7 +778,7 @@ pub async fn post_messages(
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
         let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
-        log_ctx.record(None, None, false, resp.status().is_success());
+        log_ctx.record(None, None, None, false, resp.status().is_success());
         return resp;
     }
 
@@ -906,7 +908,7 @@ async fn handle_stream_request(
                 "流式请求上游连接失败"
             );
             // 记录失败的调用日志（未选到可用凭据）
-            log_ctx.record(Some(provider.as_ref()), None, false, false);
+            log_ctx.record(Some(provider.as_ref()), None, None, false, false);
             return map_provider_error(e, input_tokens);
         }
     };
@@ -914,6 +916,7 @@ async fn handle_stream_request(
     let log_id = log_ctx.record(
         Some(provider.as_ref()),
         Some(api_result.credential_id),
+        api_result.proxy_host.clone(),
         api_result.session_affinity_hit,
         true,
     );
@@ -1159,7 +1162,7 @@ async fn handle_non_stream_request(
         Ok(resp) => resp,
         Err(e) => {
             // 记录失败的调用日志（未选到可用凭据）
-            log_ctx.record(Some(provider.as_ref()), None, false, false);
+            log_ctx.record(Some(provider.as_ref()), None, None, false, false);
             return map_provider_error(e, input_tokens);
         }
     };
@@ -1167,6 +1170,7 @@ async fn handle_non_stream_request(
     let log_id = log_ctx.record(
         Some(provider.as_ref()),
         Some(api_result.credential_id),
+        api_result.proxy_host.clone(),
         api_result.session_affinity_hit,
         true,
     );
@@ -1655,7 +1659,7 @@ pub async fn post_messages_cc(
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
         let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
-        log_ctx.record(None, None, false, resp.status().is_success());
+        log_ctx.record(None, None, None, false, resp.status().is_success());
         return resp;
     }
 
@@ -1781,13 +1785,14 @@ async fn handle_stream_request_buffered(
     let api_result = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => {
-            log_ctx.record(Some(provider.as_ref()), None, false, false);
+            log_ctx.record(Some(provider.as_ref()), None, None, false, false);
             return map_provider_error(e, estimated_input_tokens);
         }
     };
     let log_id = log_ctx.record(
         Some(provider.as_ref()),
         Some(api_result.credential_id),
+        api_result.proxy_host.clone(),
         api_result.session_affinity_hit,
         true,
     );

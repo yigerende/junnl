@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::MultiTokenManager;
-use crate::model::config::{CacheOptimizerConfig, Config, ModelMappingConfig};
+use crate::model::config::{CacheOptimizerConfig, Config, ModelMappingConfig, ProxyProfile};
 
 use super::error::AdminServiceError;
 use super::types::{
@@ -125,6 +125,7 @@ impl AdminService {
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
                 proxy_url: entry.proxy_url,
+                proxy_ids: entry.proxy_ids,
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
@@ -189,6 +190,78 @@ impl AdminService {
         self.token_manager
             .set_max_concurrency_batch(ids, max_concurrency)
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+    }
+
+    pub fn list_proxies(&self) -> Vec<ProxyProfile> {
+        self.token_manager.list_proxy_profiles()
+    }
+
+    pub fn create_proxy(&self, profile: ProxyProfile) -> Result<ProxyProfile, AdminServiceError> {
+        self.token_manager
+            .create_proxy_profile(profile)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))
+    }
+
+    pub fn update_proxy(
+        &self,
+        id: u64,
+        profile: ProxyProfile,
+    ) -> Result<ProxyProfile, AdminServiceError> {
+        self.token_manager
+            .update_proxy_profile(id, profile)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    pub fn delete_proxy(&self, id: u64) -> Result<(), AdminServiceError> {
+        self.token_manager.delete_proxy_profile(id).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("正在被凭据使用") {
+                AdminServiceError::InvalidCredential(msg)
+            } else {
+                self.classify_error(e, id)
+            }
+        })
+    }
+
+    pub async fn test_proxy(&self, id: u64) -> crate::kiro::token_manager::ProxyConnectivityResult {
+        self.token_manager.test_proxy_profile(id).await
+    }
+
+    pub fn set_credential_proxies(
+        &self,
+        id: u64,
+        proxy_ids: Vec<u64>,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_credential_proxy_ids(id, proxy_ids)
+            .map_err(|e| {
+                let msg = e.to_string();
+                // 代理 ID 非法时保留原始信息（"代理不存在: N"），
+                // 否则会被 classify_error 误判为"凭据不存在"。
+                if msg.contains("代理不存在") {
+                    AdminServiceError::InvalidCredential(msg)
+                } else {
+                    self.classify_error(e, id)
+                }
+            })
+    }
+
+    pub fn set_credential_proxies_batch(
+        &self,
+        ids: &[u64],
+        proxy_ids: Vec<u64>,
+    ) -> Result<usize, AdminServiceError> {
+        self.token_manager
+            .set_credential_proxy_ids_batch(ids, proxy_ids)
+            .map_err(|e| {
+                let msg = e.to_string();
+                // 代理 ID 非法属于客户端请求错误（400），而非内部错误（500）。
+                if msg.contains("代理不存在") {
+                    AdminServiceError::InvalidCredential(msg)
+                } else {
+                    AdminServiceError::InternalError(msg)
+                }
+            })
     }
 
     /// 重置失败计数并重新启用
@@ -385,6 +458,7 @@ impl AdminService {
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
+            proxy_ids: req.proxy_ids,
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,

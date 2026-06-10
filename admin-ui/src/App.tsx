@@ -6,10 +6,11 @@ import { CacheOptimizer } from '@/components/cache-optimizer'
 import { ModelMapping } from '@/components/model-mapping'
 import { CallLog } from '@/components/call-log'
 import { RuntimeLog } from '@/components/runtime-log'
+import { ProxyManager } from '@/components/proxy-manager'
 import { Toaster } from '@/components/ui/sonner'
 import { AppLayout } from '@/components/app-layout'
 
-type Page = 'credentials' | 'cache-optimizer' | 'model-mapping' | 'call-log' | 'runtime-log'
+type Page = 'credentials' | 'proxies' | 'cache-optimizer' | 'model-mapping' | 'call-log' | 'runtime-log'
 
 function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false)
@@ -34,6 +35,7 @@ function App() {
       {isLoggedIn ? (
         <AppLayout currentPage={currentPage} onNavigate={setCurrentPage} onLogout={handleLogout}>
           {currentPage === 'credentials' && <Dashboard />}
+          {currentPage === 'proxies' && <ProxyManager />}
           {currentPage === 'cache-optimizer' && <CacheOptimizer />}
           {currentPage === 'model-mapping' && <ModelMapping />}
           {currentPage === 'call-log' && <CallLog />}

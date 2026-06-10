@@ -31,6 +31,10 @@ interface CredentialInput {
   authMethod?: string
   provider?: string
   endpoint?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+  proxyIds?: number[]
 }
 
 interface VerificationResult {
@@ -236,6 +240,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               apiRegion: cred.apiRegion?.trim() || undefined,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
+              proxyUrl: cred.proxyUrl?.trim() || undefined,
+              proxyUsername: cred.proxyUsername?.trim() || undefined,
+              proxyPassword: cred.proxyPassword?.trim() || undefined,
+              proxyIds: Array.isArray(cred.proxyIds) ? cred.proxyIds : undefined,
             })
 
             addedCredId = addedCred.credentialId
@@ -286,6 +294,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             priority: cred.priority || 0,
             machineId: cred.machineId?.trim() || undefined,
             endpoint: cred.endpoint?.trim() || undefined,
+            proxyUrl: cred.proxyUrl?.trim() || undefined,
+            proxyUsername: cred.proxyUsername?.trim() || undefined,
+            proxyPassword: cred.proxyPassword?.trim() || undefined,
+            proxyIds: Array.isArray(cred.proxyIds) ? cred.proxyIds : undefined,
           })
 
           addedCredId = addedCred.credentialId

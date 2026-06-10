@@ -24,6 +24,8 @@ use parking_lot::Mutex;
 pub struct ApiCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
+    /// 本次实际成功连接上游时使用的代理主机（host:port）。
+    pub proxy_host: Option<String>,
     /// 是否命中会话亲和（仅供调用日志展示）
     pub session_affinity_hit: bool,
     /// 并发槽位守卫：必须随响应（流式/非流式）一路持有到 body 读完，
@@ -83,8 +85,6 @@ struct ModelCache {
 /// 按凭据 `endpoint` 字段选择 [`KiroEndpoint`] 实现
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
-    /// 全局代理配置（用于凭据无自定义代理时的回退）
-    global_proxy: Option<ProxyConfig>,
     /// Client 缓存：key = effective proxy config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
     client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
@@ -126,7 +126,6 @@ impl KiroProvider {
 
         Self {
             token_manager,
-            global_proxy: proxy,
             client_cache: Mutex::new(cache),
             tls_backend,
             endpoints,
@@ -135,9 +134,9 @@ impl KiroProvider {
         }
     }
 
-    /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
-    fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+    /// 根据代理配置获取（或创建并缓存）对应的 reqwest::Client
+    fn client_for_proxy(&self, effective: Option<&ProxyConfig>) -> anyhow::Result<Client> {
+        let effective = effective.cloned();
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
@@ -145,6 +144,29 @@ impl KiroProvider {
         let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
         cache.insert(effective, client.clone());
         Ok(client)
+    }
+
+    /// 根据凭据的第一优先级代理获取 Client。
+    fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
+        let effective = self.token_manager.effective_proxy_for(credentials);
+        self.client_for_proxy(effective.as_ref())
+    }
+
+    fn proxy_host_label(proxy: &ProxyConfig) -> String {
+        let without_scheme = proxy
+            .url
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(proxy.url.as_str());
+        let without_auth = without_scheme
+            .rsplit_once('@')
+            .map(|(_, rest)| rest)
+            .unwrap_or(without_scheme);
+        without_auth
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or(without_auth)
+            .to_string()
     }
 
     /// 根据凭据选择 endpoint 实现
@@ -302,29 +324,44 @@ impl KiroProvider {
             let url = endpoint.mcp_url(&rctx);
             let body = endpoint.transform_mcp_body(request_body, &rctx);
 
-            let base = self
-                .client_for(&ctx.credentials)?
-                .post(&url)
-                .body(body)
-                .header("content-type", "application/json")
-                .header("Connection", "close");
-            let request = endpoint.decorate_mcp(base, &rctx);
+            let proxy_candidates = self.token_manager.proxy_candidates_for(&ctx.credentials);
+            let mut response = None;
+            for (proxy_index, proxy) in proxy_candidates.iter().enumerate() {
+                let base = self
+                    .client_for_proxy(proxy.as_ref())?
+                    .post(&url)
+                    .body(body.clone())
+                    .header("content-type", "application/json")
+                    .header("Connection", "close");
+                let request = endpoint.decorate_mcp(base, &rctx);
 
-            let response = match request.send().await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    tracing::warn!(
-                        "MCP 请求发送失败（尝试 {}/{}）: {}",
-                        attempt + 1,
-                        max_retries,
-                        e
-                    );
-                    last_error = Some(e.into());
-                    if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt)).await;
+                match request.send().await {
+                    Ok(resp) => {
+                        response = Some(resp);
+                        break;
                     }
-                    continue;
+                    Err(e) => {
+                        tracing::warn!(
+                            "MCP 请求发送失败（尝试 {}/{}，代理 {}/{}）: {}",
+                            attempt + 1,
+                            max_retries,
+                            proxy_index + 1,
+                            proxy_candidates.len(),
+                            e
+                        );
+                        last_error = Some(e.into());
+                        if proxy_index + 1 < proxy_candidates.len() {
+                            continue;
+                        }
+                    }
                 }
+            }
+
+            let Some(response) = response else {
+                if attempt + 1 < max_retries {
+                    sleep(Self::retry_delay(attempt)).await;
+                }
+                continue;
             };
 
             let status = response.status();
@@ -477,31 +514,48 @@ impl KiroProvider {
             let url = endpoint.api_url(&rctx);
             let body = endpoint.transform_api_body(request_body, &rctx);
 
-            let base = self
-                .client_for(&ctx.credentials)?
-                .post(&url)
-                .body(body)
-                .header("content-type", "application/json")
-                .header("Connection", "close");
-            let request = endpoint.decorate_api(base, &rctx);
+            let proxy_candidates = self.token_manager.proxy_candidates_for(&ctx.credentials);
+            let mut response = None;
+            let mut proxy_host = None;
+            for (proxy_index, proxy) in proxy_candidates.iter().enumerate() {
+                let base = self
+                    .client_for_proxy(proxy.as_ref())?
+                    .post(&url)
+                    .body(body.clone())
+                    .header("content-type", "application/json")
+                    .header("Connection", "close");
+                let request = endpoint.decorate_api(base, &rctx);
 
-            let response = match request.send().await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    tracing::warn!(
-                        "API 请求发送失败（尝试 {}/{}）: {}",
-                        attempt + 1,
-                        max_retries,
-                        e
-                    );
-                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
-                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
-                    last_error = Some(e.into());
-                    if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt)).await;
+                match request.send().await {
+                    Ok(resp) => {
+                        response = Some(resp);
+                        proxy_host = proxy.as_ref().map(Self::proxy_host_label);
+                        break;
                     }
-                    continue;
+                    Err(e) => {
+                        tracing::warn!(
+                            "API 请求发送失败（尝试 {}/{}，代理 {}/{}）: {}",
+                            attempt + 1,
+                            max_retries,
+                            proxy_index + 1,
+                            proxy_candidates.len(),
+                            e
+                        );
+                        // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
+                        // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
+                        last_error = Some(e.into());
+                        if proxy_index + 1 < proxy_candidates.len() {
+                            continue;
+                        }
+                    }
                 }
+            }
+
+            let Some(response) = response else {
+                if attempt + 1 < max_retries {
+                    sleep(Self::retry_delay(attempt)).await;
+                }
+                continue;
             };
 
             let status = response.status();
@@ -512,6 +566,7 @@ impl KiroProvider {
                 return Ok(ApiCallResult {
                     response,
                     credential_id: ctx.id,
+                    proxy_host,
                     session_affinity_hit: ctx.session_affinity_hit,
                     slot_guard,
                 });

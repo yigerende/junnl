@@ -56,6 +56,7 @@ export function CallLog() {
         log.endpoint,
         log.clientIp ?? '',
         log.clientHost ?? '',
+        log.proxyHost ?? '',
         log.conversationId ?? '',
         log.credentialId != null ? `#${log.credentialId}` : '',
       ]
@@ -137,7 +138,7 @@ export function CallLog() {
           <div className="flex items-center gap-3 flex-wrap">
             <input
               type="text"
-              placeholder="搜索 模型 / IP / 域名 / conversationId / 凭据#..."
+              placeholder="搜索 模型 / IP / 代理IP / 域名 / conversationId / 凭据#..."
               value={search}
               onChange={e => setSearch(e.target.value)}
               className="flex-1 min-w-[220px] h-9 rounded-md border border-input bg-background px-3 text-sm"
@@ -185,6 +186,7 @@ export function CallLog() {
                     <th className="py-2 px-2 font-medium">时间</th>
                     <th className="py-2 px-2 font-medium">来源</th>
                     <th className="py-2 px-2 font-medium">凭据</th>
+                    <th className="py-2 px-2 font-medium">代理IP</th>
                     <th className="py-2 px-2 font-medium">亲和</th>
                     <th className="py-2 px-2 font-medium">请求次数</th>
                     <th className="py-2 px-2 font-medium">下游模型</th>
@@ -211,6 +213,11 @@ export function CallLog() {
                       <td className="py-1.5 px-2 text-xs whitespace-nowrap">
                         {log.credentialId != null
                           ? <span className="px-1.5 py-0.5 rounded bg-primary/10 text-primary">#{log.credentialId}</span>
+                          : <span className="text-muted-foreground">—</span>}
+                      </td>
+                      <td className="py-1.5 px-2 text-xs whitespace-nowrap">
+                        {log.proxyHost
+                          ? <span className="font-mono">{log.proxyHost}</span>
                           : <span className="text-muted-foreground">—</span>}
                       </td>
                       <td className="py-1.5 px-2 text-xs whitespace-nowrap">

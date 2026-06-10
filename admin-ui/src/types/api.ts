@@ -25,6 +25,7 @@ export interface CredentialStatusItem {
   lastUsedAt: string | null
   hasProxy: boolean
   proxyUrl?: string
+  proxyIds: number[]
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
@@ -82,6 +83,32 @@ export interface BatchSetConcurrencyRequest {
   maxConcurrency: number
 }
 
+export interface SetCredentialProxiesRequest {
+  proxyIds: number[]
+}
+
+export interface BatchSetCredentialProxiesRequest {
+  ids: number[]
+  proxyIds: number[]
+}
+
+export interface ProxyProfile {
+  id: number
+  name: string
+  protocol: 'http' | 'https' | 'socks5'
+  host: string
+  port: number
+  username?: string
+  password?: string
+}
+
+export interface ProxyConnectivityResult {
+  success: boolean
+  message: string
+  latencyMs?: number
+  ipAddress?: string
+}
+
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string
@@ -96,6 +123,7 @@ export interface AddCredentialRequest {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
+  proxyIds?: number[]
   kiroApiKey?: string
   endpoint?: string
   maxConcurrency?: number
@@ -182,6 +210,7 @@ export interface CallLogEntry {
   clientIp?: string | null
   clientHost?: string | null
   credentialId?: number | null
+  proxyHost?: string | null
   credentialRequestCount?: number | null
   conversationId?: string | null
   conversationIdSource?: string | null

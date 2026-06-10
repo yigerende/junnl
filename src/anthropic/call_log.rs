@@ -45,6 +45,9 @@ pub struct CallLogEntry {
     /// 实际使用的凭据 ID
     #[serde(default)]
     pub credential_id: Option<u64>,
+    /// 实际成功连接上游时使用的代理主机（host:port）
+    #[serde(default)]
+    pub proxy_host: Option<String>,
     /// 该凭据累计请求次数（含本次、含失败）
     #[serde(default)]
     pub credential_request_count: Option<u64>,
@@ -214,6 +217,7 @@ mod tests {
             client_ip: None,
             client_host: None,
             credential_id: Some(1),
+            proxy_host: None,
             credential_request_count: None,
             conversation_id: None,
             conversation_id_source: None,

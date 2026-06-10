@@ -109,6 +109,14 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
 
+    /// 代理池代理 ID 列表，按优先级从高到低排列。
+    ///
+    /// 新版 Admin UI 使用该字段引用 config.json 中的 proxies；为空时继续兼容旧的
+    /// proxyUrl/proxyUsername/proxyPassword 字段。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub proxy_ids: Vec<u64>,
+
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
     pub disabled: bool,
@@ -421,6 +429,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_ids: Vec::new(),
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
@@ -584,6 +593,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_ids: Vec::new(),
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
@@ -617,6 +627,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_ids: Vec::new(),
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
@@ -733,6 +744,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_ids: Vec::new(),
             disabled: false,
             kiro_api_key: None,
             endpoint: None,

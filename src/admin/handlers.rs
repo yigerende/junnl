@@ -14,11 +14,12 @@ use std::convert::Infallible;
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, BatchSetConcurrencyRequest, SetConcurrencyRequest,
-        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
+        AddCredentialRequest, BatchSetConcurrencyRequest, BatchSetCredentialProxiesRequest,
+        SetConcurrencyRequest, SetCredentialProxiesRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
     },
 };
-use crate::model::config::{CacheOptimizerConfig, ModelMappingConfig};
+use crate::model::config::{CacheOptimizerConfig, ModelMappingConfig, ProxyProfile};
 
 /// GET /api/admin/credentials
 /// 获取所有凭据状态
@@ -125,6 +126,87 @@ pub async fn batch_set_concurrency(
             )))
             .into_response()
         }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/proxies
+/// 获取代理池列表
+pub async fn get_proxies(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(serde_json::json!({ "proxies": state.service.list_proxies() }))
+}
+
+/// POST /api/admin/proxies
+/// 新增代理
+pub async fn create_proxy(
+    State(state): State<AdminState>,
+    Json(payload): Json<ProxyProfile>,
+) -> impl IntoResponse {
+    match state.service.create_proxy(payload) {
+        Ok(proxy) => Json(proxy).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/proxies/:id
+/// 更新代理
+pub async fn update_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<ProxyProfile>,
+) -> impl IntoResponse {
+    match state.service.update_proxy(id, payload) {
+        Ok(proxy) => Json(proxy).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/proxies/:id
+/// 删除代理
+pub async fn delete_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.delete_proxy(id) {
+        Ok(_) => Json(SuccessResponse::new(format!("代理 #{} 已删除", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxies/:id/test
+/// 测试代理连接
+pub async fn test_proxy(State(state): State<AdminState>, Path(id): Path<u64>) -> impl IntoResponse {
+    Json(state.service.test_proxy(id).await)
+}
+
+/// POST /api/admin/credentials/:id/proxies
+/// 设置单个凭据的代理优先级列表
+pub async fn set_credential_proxies(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialProxiesRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_proxies(id, payload.proxy_ids) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 代理已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/proxies/batch
+/// 批量设置凭据的代理优先级列表
+pub async fn batch_set_credential_proxies(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchSetCredentialProxiesRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .set_credential_proxies_batch(&payload.ids, payload.proxy_ids)
+    {
+        Ok(applied) => Json(SuccessResponse::new(format!(
+            "已为 {} 个凭据设置代理",
+            applied
+        )))
+        .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

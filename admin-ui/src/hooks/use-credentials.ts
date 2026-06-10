@@ -5,6 +5,13 @@ import {
   setCredentialPriority,
   setCredentialConcurrency,
   batchSetConcurrency,
+  getProxies,
+  createProxy,
+  updateProxy,
+  deleteProxy,
+  testProxy,
+  setCredentialProxies,
+  batchSetCredentialProxies,
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
@@ -14,7 +21,7 @@ import {
   getLoadBalancingMode,
   setLoadBalancingMode,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type { AddCredentialRequest, ProxyProfile } from '@/types/api'
 
 // 查询凭据列表
 // refreshSeconds: 自动刷新间隔（秒），<=0 表示关闭自动刷新
@@ -92,6 +99,74 @@ export function useBatchSetConcurrency() {
   return useMutation({
     mutationFn: ({ ids, maxConcurrency }: { ids: number[]; maxConcurrency: number }) =>
       batchSetConcurrency(ids, maxConcurrency),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+export function useProxies() {
+  return useQuery({
+    queryKey: ['proxies'],
+    queryFn: getProxies,
+  })
+}
+
+export function useCreateProxy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: Omit<ProxyProfile, 'id'>) => createProxy(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxies'] })
+    },
+  })
+}
+
+export function useUpdateProxy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, proxy }: { id: number; proxy: Omit<ProxyProfile, 'id'> }) =>
+      updateProxy(id, proxy),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxies'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+export function useDeleteProxy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => deleteProxy(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxies'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+export function useTestProxy() {
+  return useMutation({
+    mutationFn: (id: number) => testProxy(id),
+  })
+}
+
+export function useSetCredentialProxies() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, proxyIds }: { id: number; proxyIds: number[] }) =>
+      setCredentialProxies(id, proxyIds),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+export function useBatchSetCredentialProxies() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ ids, proxyIds }: { ids: number[]; proxyIds: number[] }) =>
+      batchSetCredentialProxies(ids, proxyIds),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
