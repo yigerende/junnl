@@ -10,15 +10,32 @@ use std::path::Path;
 use crate::http_client::ProxyConfig;
 use crate::model::config::Config;
 
-/// Builder ID / IdC 账号的默认 profile ARN。
+/// Kiro IDE 给 Builder ID 写入的占位 profile ARN。
 ///
-/// Kiro 官方客户端在账号文件缺少 profileArn 时仍会补充该默认值。
+/// 该 ARN 不是有效 profile；Builder ID 账号请求上游 API 时不能携带它。
 pub const KIRO_BUILDER_ID_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
 
 /// Google / GitHub Social 登录账号的默认 profile ARN。
 pub const KIRO_SOCIAL_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+
+const KIRO_ENTERPRISE_FALLBACK_ACCOUNT_ID: &str = "610548660232";
+const KIRO_ENTERPRISE_FALLBACK_PROFILE_ID: &str = "VNECVYCYYAWN";
+
+/// Enterprise / IAM Identity Center 自动获取 profile 失败时使用的 fallback ARN。
+pub fn enterprise_fallback_profile_arn(region: Option<&str>) -> String {
+    let region = region.map(str::trim).unwrap_or_default();
+    let region = if region.to_ascii_lowercase().starts_with("eu-") {
+        "eu-central-1"
+    } else {
+        "us-east-1"
+    };
+
+    format!(
+        "arn:aws:codewhisperer:{region}:{KIRO_ENTERPRISE_FALLBACK_ACCOUNT_ID}:profile/{KIRO_ENTERPRISE_FALLBACK_PROFILE_ID}"
+    )
+}
 
 /// Kiro OAuth 凭证
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -29,22 +46,27 @@ pub struct KiroCredentials {
     pub id: Option<u64>,
 
     /// 访问令牌
+    #[serde(alias = "access_token")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub access_token: Option<String>,
 
     /// 刷新令牌
+    #[serde(alias = "refresh_token")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
 
     /// Profile ARN
+    #[serde(alias = "profile_arn")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,
 
     /// 过期时间 (RFC3339 格式)
+    #[serde(alias = "expires_at")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
 
     /// 认证方式 (social / idc)
+    #[serde(alias = "auth_method")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
 
@@ -54,11 +76,18 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
 
+    /// SSO Start URL（Enterprise / IAM Identity Center 账号使用）
+    #[serde(alias = "start_url")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_url: Option<String>,
+
     /// OIDC Client ID (IdC 认证需要)
+    #[serde(alias = "client_id")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
 
     /// OIDC Client Secret (IdC 认证需要)
+    #[serde(alias = "client_secret")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
 
@@ -73,15 +102,18 @@ pub struct KiroCredentials {
     pub region: Option<String>,
 
     /// 凭据级 Auth Region（用于 Token 刷新）
+    #[serde(alias = "auth_region")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_region: Option<String>,
 
     /// 凭据级 API Region（用于 API 请求）
+    #[serde(alias = "api_region")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_region: Option<String>,
 
     /// 凭据级 Machine ID 配置（可选）
     /// 未配置时回退到 config.json 的 machineId；都未配置时运行时生成随机值并写回
+    #[serde(alias = "machine_id")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
 
@@ -90,6 +122,7 @@ pub struct KiroCredentials {
     pub email: Option<String>,
 
     /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
+    #[serde(alias = "subscription_title")]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub subscription_title: Option<String>,
@@ -98,14 +131,17 @@ pub struct KiroCredentials {
     /// 支持 http/https/socks5 协议
     /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
     /// 未配置时回退到全局代理配置
+    #[serde(alias = "proxy_url")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
 
     /// 凭据级代理认证用户名（可选）
+    #[serde(alias = "proxy_username")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_username: Option<String>,
 
     /// 凭据级代理认证密码（可选）
+    #[serde(alias = "proxy_password")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
 
@@ -124,6 +160,7 @@ pub struct KiroCredentials {
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
+    #[serde(alias = "kiro_api_key")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kiro_api_key: Option<String>,
 
@@ -155,6 +192,39 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
         "api_key"
     } else {
         value
+    }
+}
+
+fn is_builder_id_provider_value(value: &str) -> bool {
+    let normalized = value
+        .trim()
+        .chars()
+        .filter(|c| *c != '-' && *c != '_' && !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+
+    normalized == "builderid" || normalized == "awsbuilderid"
+}
+
+#[allow(dead_code)] // 上游 Builder ID 判定辅助，暂未接线，保留备用
+fn is_builder_id_auth_method_value(value: &str) -> bool {
+    is_builder_id_provider_value(value)
+}
+
+fn is_enterprise_provider_value(value: &str) -> bool {
+    value.eq_ignore_ascii_case("enterprise") || value.eq_ignore_ascii_case("externalidp")
+}
+
+fn is_social_provider_value(value: &str) -> bool {
+    value.eq_ignore_ascii_case("github") || value.eq_ignore_ascii_case("google")
+}
+
+fn valid_explicit_profile_arn(value: Option<&str>) -> Option<&str> {
+    let trimmed = value?.trim();
+    if trimmed.is_empty() || trimmed == KIRO_BUILDER_ID_PROFILE_ARN {
+        None
+    } else {
+        Some(trimmed)
     }
 }
 
@@ -286,6 +356,7 @@ impl KiroCredentials {
                 m.eq_ignore_ascii_case("idc")
                     || m.eq_ignore_ascii_case("builder-id")
                     || m.eq_ignore_ascii_case("iam")
+                    || m.eq_ignore_ascii_case("external_idp")
             })
             .unwrap_or_else(|| self.client_id.is_some() && self.client_secret.is_some())
     }
@@ -296,10 +367,18 @@ impl KiroCredentials {
             return false;
         }
 
+        let provider_is_non_social = self
+            .provider
+            .as_deref()
+            .is_some_and(|p| is_enterprise_provider_value(p) || is_builder_id_provider_value(p));
+        if provider_is_non_social {
+            return false;
+        }
+
         let provider_is_social = self
             .provider
             .as_deref()
-            .is_some_and(|p| p.eq_ignore_ascii_case("github") || p.eq_ignore_ascii_case("google"));
+            .is_some_and(is_social_provider_value);
 
         let auth_is_social = self
             .auth_method
@@ -310,27 +389,126 @@ impl KiroCredentials {
         provider_is_social || auth_is_social || !self.is_idc_auth()
     }
 
-    /// 获取请求 Kiro API 时应使用的 profileArn。
-    ///
-    /// 最新 Kiro 客户端会在缺失 profileArn 时按登录方式补默认值：
-    /// - Google/GitHub/Social → social profile
-    /// - BuilderId/IdC/IAM/Enterprise → builder profile
-    pub fn resolved_profile_arn(&self) -> Option<String> {
-        if let Some(profile_arn) = self.profile_arn.as_deref() {
-            let trimmed = profile_arn.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
+    /// 判断凭据是否是 Enterprise / IAM Identity Center / External IdP。
+    pub fn is_enterprise_auth(&self) -> bool {
+        if self.is_api_key_credential() {
+            return false;
         }
 
+        if self
+            .auth_method
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case("social"))
+            || self
+                .provider
+                .as_deref()
+                .is_some_and(is_social_provider_value)
+        {
+            return false;
+        }
+
+        let provider_is_enterprise = self
+            .provider
+            .as_deref()
+            .is_some_and(is_enterprise_provider_value);
+
+        let auth_is_external_idp = self
+            .auth_method
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case("external_idp"));
+
+        let has_enterprise_start_url = self
+            .start_url
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|url| !url.is_empty());
+
+        provider_is_enterprise || auth_is_external_idp || has_enterprise_start_url
+    }
+
+    /// 判断凭据是否是 External IdP；流式接口需要额外 TokenType header。
+    pub fn is_external_idp_auth(&self) -> bool {
+        self.auth_method
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case("external_idp"))
+            || self
+                .provider
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case("externalidp"))
+    }
+
+    /// 判断凭据是否明确标识为 AWS Builder ID。
+    #[allow(dead_code)] // 上游 Builder ID 判定辅助，暂未接线，保留备用
+    pub fn is_builder_id_auth(&self) -> bool {
+        if self.is_api_key_credential() || self.is_social_auth() || self.is_enterprise_auth() {
+            return false;
+        }
+
+        let provider_is_builder_id = self
+            .provider
+            .as_deref()
+            .is_some_and(is_builder_id_provider_value);
+
+        let auth_method_is_builder_id = self
+            .auth_method
+            .as_deref()
+            .is_some_and(is_builder_id_auth_method_value);
+
+        provider_is_builder_id || auth_method_is_builder_id
+    }
+
+    /// 判断 ARN 是否为 Kiro IDE Builder ID 占位符。
+    pub fn is_placeholder_profile_arn(profile_arn: &str) -> bool {
+        profile_arn.trim() == KIRO_BUILDER_ID_PROFILE_ARN
+    }
+
+    /// 判断是否应该尝试通过 ListAvailableProfiles 自动获取真实 profileArn。
+    pub fn should_fetch_profile_arn(&self) -> bool {
+        if self.is_api_key_credential() {
+            return false;
+        }
+
+        self.profile_arn
+            .as_deref()
+            .map(str::trim)
+            .map(|arn| arn.is_empty() || Self::is_placeholder_profile_arn(arn))
+            .unwrap_or(true)
+    }
+
+    /// 获取请求 Kiro API 时应使用的 profileArn。
+    ///
+    /// 与 KAM 1.7.5 的 resolveProfileArn 保持一致：
+    /// 显式真实 ARN > Enterprise fallback > Social 固定 ARN > Builder ID 占位符。
+    /// 注意：Builder ID 占位符只适合 ListAvailableModels，不适合流式生成接口。
+    pub fn resolved_profile_arn(&self) -> Option<String> {
         if self.is_api_key_credential() {
             return None;
         }
 
-        if self.is_social_auth() {
+        if let Some(profile_arn) = valid_explicit_profile_arn(self.profile_arn.as_deref()) {
+            return Some(profile_arn.to_string());
+        }
+
+        if self.is_enterprise_auth() {
+            Some(enterprise_fallback_profile_arn(
+                self.region.as_deref().or(self.api_region.as_deref()),
+            ))
+        } else if self.is_social_auth() {
             Some(KIRO_SOCIAL_PROFILE_ARN.to_string())
         } else {
             Some(KIRO_BUILDER_ID_PROFILE_ARN.to_string())
+        }
+    }
+
+    /// 获取流式生成请求中应传递的 profileArn。
+    ///
+    /// Enterprise fallback / 真实 ARN / Social ARN 都会发送；Builder ID 占位符会移除。
+    pub fn resolved_stream_profile_arn(&self) -> Option<String> {
+        let arn = self.resolved_profile_arn()?;
+        if Self::is_placeholder_profile_arn(&arn) && !self.is_enterprise_auth() {
+            None
+        } else {
+            Some(arn)
         }
     }
 
@@ -397,6 +575,46 @@ mod tests {
     }
 
     #[test]
+    fn test_from_json_accepts_snake_case_windows_idc_export() {
+        let json = r#"{
+            "type": "kiro",
+            "access_token": "test_access",
+            "refresh_token": "test_refresh",
+            "profile_arn": "arn:aws:codewhisperer:us-east-1:123:profile/REAL",
+            "expires_at": "2026-06-05T09:38:26.836Z",
+            "auth_method": "idc",
+            "provider": "Enterprise",
+            "last_refresh": "2026-06-05T08:38:26.836Z",
+            "email": "user@example.com",
+            "client_id": "client123",
+            "client_secret": "secret456",
+            "region": "us-east-1",
+            "start_url": "https://d-example.awsapps.com/start",
+            "machine_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }"#;
+
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.access_token, Some("test_access".to_string()));
+        assert_eq!(creds.refresh_token, Some("test_refresh".to_string()));
+        assert_eq!(
+            creds.profile_arn,
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL".to_string())
+        );
+        assert_eq!(creds.auth_method, Some("idc".to_string()));
+        assert_eq!(creds.provider, Some("Enterprise".to_string()));
+        assert_eq!(creds.client_id, Some("client123".to_string()));
+        assert_eq!(creds.client_secret, Some("secret456".to_string()));
+        assert_eq!(
+            creds.start_url,
+            Some("https://d-example.awsapps.com/start".to_string())
+        );
+        assert_eq!(
+            creds.machine_id,
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        );
+    }
+
+    #[test]
     fn test_from_json_with_unknown_keys() {
         let json = r#"{
             "accessToken": "test_token",
@@ -417,6 +635,7 @@ mod tests {
             expires_at: None,
             auth_method: Some("social".to_string()),
             provider: None,
+            start_url: None,
             client_id: None,
             client_secret: None,
             priority: 0,
@@ -458,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolved_profile_arn_idc_default() {
+    fn test_resolved_profile_arn_idc_without_profile_arn_uses_builder_placeholder() {
         let creds = KiroCredentials {
             auth_method: Some("idc".to_string()),
             client_id: Some("client".to_string()),
@@ -471,6 +690,7 @@ mod tests {
             creds.resolved_profile_arn().as_deref(),
             Some(KIRO_BUILDER_ID_PROFILE_ARN)
         );
+        assert_eq!(creds.resolved_stream_profile_arn(), None);
     }
 
     #[test]
@@ -485,6 +705,168 @@ mod tests {
             creds.resolved_profile_arn().as_deref(),
             Some("arn:explicit")
         );
+    }
+
+    #[test]
+    fn test_resolved_profile_arn_preserves_explicit_value_for_builder_id() {
+        let creds = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            provider: Some("BuilderId".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+
+        assert!(creds.is_builder_id_auth());
+        assert_eq!(
+            creds.resolved_profile_arn().as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL")
+        );
+        assert_eq!(
+            creds.resolved_stream_profile_arn().as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL")
+        );
+    }
+
+    #[test]
+    fn test_resolved_profile_arn_idc_without_start_url_keeps_real_explicit_arn() {
+        let creds = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+
+        assert!(!creds.is_builder_id_auth());
+        assert_eq!(
+            creds.resolved_profile_arn().as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL")
+        );
+        assert_eq!(
+            creds.resolved_stream_profile_arn().as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL")
+        );
+    }
+
+    #[test]
+    fn test_resolved_profile_arn_enterprise_with_start_url_keeps_real_explicit_arn() {
+        let creds = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL".to_string()),
+            start_url: Some("https://d-example.awsapps.com/start/".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+
+        assert!(!creds.is_builder_id_auth());
+        assert_eq!(
+            creds.resolved_profile_arn().as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL")
+        );
+    }
+
+    #[test]
+    fn test_resolved_profile_arn_keeps_builder_id_placeholder_for_models_only() {
+        let creds = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            profile_arn: Some(KIRO_BUILDER_ID_PROFILE_ARN.to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            creds.resolved_profile_arn().as_deref(),
+            Some(KIRO_BUILDER_ID_PROFILE_ARN)
+        );
+        assert_eq!(creds.resolved_stream_profile_arn(), None);
+    }
+
+    #[test]
+    fn test_resolved_stream_profile_arn_omits_builder_placeholder() {
+        let creds = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            creds.resolved_profile_arn().as_deref(),
+            Some(KIRO_BUILDER_ID_PROFILE_ARN)
+        );
+        assert_eq!(creds.resolved_stream_profile_arn(), None);
+    }
+
+    #[test]
+    fn test_resolved_stream_profile_arn_keeps_social_default() {
+        let creds = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            provider: Some("Github".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            creds.resolved_stream_profile_arn().as_deref(),
+            Some(KIRO_SOCIAL_PROFILE_ARN)
+        );
+    }
+
+    #[test]
+    fn test_resolved_stream_profile_arn_keeps_real_explicit_arn() {
+        let creds = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL".to_string()),
+            start_url: Some("https://d-example.awsapps.com/start/".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            creds.resolved_stream_profile_arn().as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL")
+        );
+    }
+
+    #[test]
+    fn test_external_idp_auth_method_is_preserved_for_token_type_header() {
+        let json = r#"[
+            {"refreshToken": "test", "authMethod": "external_idp"}
+        ]"#;
+
+        let config: CredentialsConfig = serde_json::from_str(json).unwrap();
+        let list = config.into_sorted_credentials();
+
+        assert_eq!(list[0].auth_method.as_deref(), Some("external_idp"));
+        assert!(list[0].is_idc_auth());
+        assert!(list[0].is_external_idp_auth());
+        assert_eq!(
+            list[0].resolved_profile_arn(),
+            Some(enterprise_fallback_profile_arn(None))
+        );
+    }
+
+    #[test]
+    fn test_start_url_roundtrip() {
+        let json = r#"{
+            "refreshToken": "test_refresh",
+            "authMethod": "idc",
+            "startUrl": "https://d-example.awsapps.com/start/"
+        }"#;
+
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(
+            creds.start_url.as_deref(),
+            Some("https://d-example.awsapps.com/start/")
+        );
+
+        let serialized = creds.to_pretty_json().unwrap();
+        assert!(serialized.contains("startUrl"));
+        assert!(serialized.contains("https://d-example.awsapps.com/start/"));
     }
 
     #[test]
@@ -581,6 +963,7 @@ mod tests {
             expires_at: None,
             auth_method: None,
             provider: None,
+            start_url: None,
             client_id: None,
             client_secret: None,
             priority: 0,
@@ -615,6 +998,7 @@ mod tests {
             expires_at: None,
             auth_method: None,
             provider: None,
+            start_url: None,
             client_id: None,
             client_secret: None,
             priority: 0,
@@ -732,6 +1116,7 @@ mod tests {
             expires_at: None,
             auth_method: Some("social".to_string()),
             provider: None,
+            start_url: None,
             client_id: None,
             client_secret: None,
             priority: 3,

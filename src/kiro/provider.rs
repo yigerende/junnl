@@ -42,6 +42,9 @@ const MAX_TOTAL_RETRIES: usize = 9;
 /// 动态模型列表缓存有效期
 const MODEL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
+/// 企业版账号在无法解析出 CodeWhisperer modelId 时使用的默认模型。
+const CODEWHISPERER_DEFAULT_MODEL_ID: &str = "CLAUDE_SONNET_4_20250514_V1_0";
+
 /// Kiro 官方模型信息
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -76,6 +79,20 @@ struct ListAvailableModelsResponse {
 struct ModelCache {
     models: Vec<KiroAvailableModel>,
     fetched_at: Instant,
+}
+
+/// ListAvailableProfiles 返回的单个 profile（仅取 arn）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KiroProfile {
+    arn: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListAvailableProfilesResponse {
+    #[serde(default)]
+    profiles: Vec<KiroProfile>,
 }
 
 /// Kiro API Provider
@@ -205,11 +222,23 @@ impl KiroProvider {
         let config = self.token_manager.config();
         let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
         let endpoint = self.endpoint_for(&ctx.credentials)?;
+        self.fetch_available_models_for(&ctx.credentials, &ctx.token, &machine_id, endpoint.as_ref())
+            .await
+    }
 
+    /// 用显式凭据/token 拉取模型列表（供企业版 modelId 解析复用，不另起调度上下文）。
+    async fn fetch_available_models_for(
+        &self,
+        credentials: &KiroCredentials,
+        token: &str,
+        machine_id: &str,
+        endpoint: &dyn KiroEndpoint,
+    ) -> anyhow::Result<Vec<KiroAvailableModel>> {
+        let config = self.token_manager.config();
         let rctx = RequestContext {
-            credentials: &ctx.credentials,
-            token: &ctx.token,
-            machine_id: &machine_id,
+            credentials,
+            token,
+            machine_id,
             config,
         };
 
@@ -226,7 +255,7 @@ impl KiroProvider {
                 ("maxResults", "50".to_string()),
             ];
 
-            if let Some(profile_arn) = ctx.credentials.resolved_profile_arn() {
+            if let Some(profile_arn) = credentials.resolved_profile_arn() {
                 params.push(("profileArn", profile_arn));
             }
             if let Some(token) = next_token.as_ref() {
@@ -234,7 +263,7 @@ impl KiroProvider {
             }
 
             let base = self
-                .client_for(&ctx.credentials)?
+                .client_for(credentials)?
                 .get(&url)
                 .query(&params)
                 .header("Accept", "application/json")
@@ -258,6 +287,109 @@ impl KiroProvider {
         }
 
         Ok(all_models)
+    }
+
+    /// profileArn 自愈：仅对企业版 / IdC 账号，且 `should_fetch_profile_arn()` 为真时，
+    /// 通过 ListAvailableProfiles 拉取真实 ARN 并回写持久化。
+    ///
+    /// 二开保护：额外加了 `is_enterprise_auth() || is_idc_auth()` 门控（上游仅按
+    /// should_fetch 判定）。这样 social 等账号即使缺 ARN 也保持 no-op，绝不触发
+    /// 额外网络请求，不影响既有调度路径。返回值对不满足条件者等于入参克隆。
+    async fn resolve_and_persist_profile_arn(
+        &self,
+        credential_id: u64,
+        credentials: &KiroCredentials,
+        token: &str,
+        machine_id: &str,
+        endpoint: &dyn KiroEndpoint,
+    ) -> KiroCredentials {
+        let resolved = credentials.clone();
+        // 二开保护门控：非企业/IdC 账号直接 no-op。
+        if !(resolved.is_enterprise_auth() || resolved.is_idc_auth()) {
+            return resolved;
+        }
+        if !resolved.should_fetch_profile_arn() {
+            return resolved;
+        }
+
+        let mut resolved = resolved;
+        match self
+            .fetch_enterprise_profile_arn(&resolved, token, machine_id, endpoint)
+            .await
+        {
+            Ok(Some(profile_arn)) => {
+                tracing::info!(
+                    "凭据 #{} 已通过 ListAvailableProfiles 获取 profileArn",
+                    credential_id
+                );
+                resolved.profile_arn = Some(profile_arn.clone());
+                if let Err(err) = self.token_manager.update_profile_arn(credential_id, profile_arn) {
+                    tracing::warn!(
+                        "凭据 #{} profileArn 自愈持久化失败（不影响本次请求）: {}",
+                        credential_id,
+                        err
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(
+                    "凭据 #{} ListAvailableProfiles 未获取到 profileArn: {}",
+                    credential_id,
+                    err
+                );
+            }
+        }
+
+        resolved
+    }
+
+    async fn fetch_enterprise_profile_arn(
+        &self,
+        credentials: &KiroCredentials,
+        token: &str,
+        machine_id: &str,
+        endpoint: &dyn KiroEndpoint,
+    ) -> anyhow::Result<Option<String>> {
+        let config = self.token_manager.config();
+        let rctx = RequestContext {
+            credentials,
+            token,
+            machine_id,
+            config,
+        };
+
+        let Some(url) = endpoint.profiles_url(&rctx) else {
+            return Ok(None);
+        };
+
+        let base = self
+            .client_for(credentials)?
+            .post(&url)
+            .body("{}")
+            .header("content-type", "application/json")
+            .header("Connection", "close");
+        let request = endpoint.decorate_profiles(base, &rctx);
+        let response = request.send().await?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            tracing::debug!(
+                "ListAvailableProfiles 请求失败: {} {}",
+                status,
+                body.chars().take(200).collect::<String>()
+            );
+            return Ok(None);
+        }
+
+        let data: ListAvailableProfilesResponse = response.json().await?;
+        Ok(data
+            .profiles
+            .into_iter()
+            .filter_map(|profile| profile.arn)
+            .map(|arn| arn.trim().to_string())
+            .find(|arn| !arn.is_empty()))
     }
 
     /// 获取指定凭据的总请求次数（含失败），供调用日志展示。
@@ -504,15 +636,43 @@ impl KiroProvider {
                 }
             };
 
+            // profileArn 自愈：仅对企业版/IdC 且缺真实 ARN 的账号生效（内部已门控），
+            // 其余账号此调用等价于 ctx.credentials 的克隆，无网络请求、无副作用。
+            let credentials = self
+                .resolve_and_persist_profile_arn(
+                    ctx.id,
+                    &ctx.credentials,
+                    &ctx.token,
+                    &machine_id,
+                    endpoint.as_ref(),
+                )
+                .await;
+
             let rctx = RequestContext {
-                credentials: &ctx.credentials,
+                credentials: &credentials,
                 token: &ctx.token,
                 machine_id: &machine_id,
                 config,
             };
 
             let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
+            let mut body = endpoint.transform_api_body(request_body, &rctx);
+
+            // 企业版账号：把模型名解析为 CodeWhisperer 大写 modelId 并写回请求体。
+            // 非企业账号 body 原样不变（此分支不执行）。
+            if credentials.is_enterprise_auth() {
+                let requested_model_id = Self::extract_model_from_request(&body);
+                let codewhisperer_model_id = self
+                    .resolve_codewhisperer_model_id(
+                        &credentials,
+                        &ctx.token,
+                        &machine_id,
+                        endpoint.as_ref(),
+                        requested_model_id.as_deref(),
+                    )
+                    .await;
+                body = Self::apply_payload_model_id(&body, &codewhisperer_model_id);
+            }
 
             let proxy_candidates = self.token_manager.proxy_candidates_for(&ctx.credentials);
             let mut response = None;
@@ -710,20 +870,197 @@ impl KiroProvider {
         }))
     }
 
+    /// 把请求里的模型名解析成企业版(CodeWhisperer)需要的大写 modelId。
+    ///
+    /// 仅在主循环的 `is_enterprise_auth()` 分支调用；非企业账号永不进入这里。
+    async fn resolve_codewhisperer_model_id(
+        &self,
+        credentials: &KiroCredentials,
+        token: &str,
+        machine_id: &str,
+        endpoint: &dyn KiroEndpoint,
+        requested_model_id: Option<&str>,
+    ) -> String {
+        let Some(model_id) = requested_model_id
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        else {
+            return CODEWHISPERER_DEFAULT_MODEL_ID.to_string();
+        };
+
+        if Self::is_codewhisperer_model_id(model_id) {
+            return model_id.to_string();
+        }
+
+        let cached_models = {
+            let cache = self.model_cache.lock();
+            cache
+                .as_ref()
+                .filter(|cache| cache.fetched_at.elapsed() <= MODEL_CACHE_TTL)
+                .map(|cache| cache.models.clone())
+        };
+
+        let models = match cached_models {
+            Some(models) => models,
+            None => match self
+                .fetch_available_models_for(credentials, token, machine_id, endpoint)
+                .await
+            {
+                Ok(models) => {
+                    *self.model_cache.lock() = Some(ModelCache {
+                        models: models.clone(),
+                        fetched_at: Instant::now(),
+                    });
+                    models
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "解析 CodeWhisperer modelId 时获取模型列表失败，使用默认模型: {}",
+                        err
+                    );
+                    return CODEWHISPERER_DEFAULT_MODEL_ID.to_string();
+                }
+            },
+        };
+
+        models
+            .iter()
+            .find(|model| Self::matches_requested_model(model, model_id))
+            .map(|model| model.model_id.clone())
+            .unwrap_or_else(|| CODEWHISPERER_DEFAULT_MODEL_ID.to_string())
+    }
+
     /// 从请求体中提取模型信息
     ///
-    /// 尝试解析 JSON 请求体，提取 conversationState.currentMessage.userInputMessage.modelId
+    /// 尝试解析 JSON 请求体，优先取 currentMessage 的 modelId，缺失时回退到 history。
     fn extract_model_from_request(request_body: &str) -> Option<String> {
         use serde_json::Value;
 
         let json: Value = serde_json::from_str(request_body).ok()?;
 
-        json.get("conversationState")?
-            .get("currentMessage")?
-            .get("userInputMessage")?
-            .get("modelId")?
-            .as_str()
+        let conversation_state = json.get("conversationState")?;
+
+        if let Some(model_id) = conversation_state
+            .get("currentMessage")
+            .and_then(|m| m.get("userInputMessage"))
+            .and_then(|m| m.get("modelId"))
+            .and_then(|m| m.as_str())
             .map(|s| s.to_string())
+        {
+            return Some(model_id);
+        }
+
+        conversation_state
+            .get("history")?
+            .as_array()?
+            .iter()
+            .find_map(|message| {
+                message
+                    .get("userInputMessage")?
+                    .get("modelId")?
+                    .as_str()
+                    .map(|s| s.to_string())
+            })
+    }
+
+    /// 判断字符串是否已是 CodeWhisperer 形态的 modelId（全大写 + 下划线 + 数字）。
+    fn is_codewhisperer_model_id(model_id: &str) -> bool {
+        model_id.contains('_')
+            && model_id
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    }
+
+    fn normalize_model_key(value: &str) -> String {
+        value
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect()
+    }
+
+    fn model_tokens(value: &str) -> Vec<String> {
+        value
+            .to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|token| !token.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    fn matches_requested_model(model: &KiroAvailableModel, requested_model_id: &str) -> bool {
+        let requested_key = Self::normalize_model_key(requested_model_id);
+        let model_id_key = Self::normalize_model_key(&model.model_id);
+        if model_id_key == requested_key || model_id_key.contains(&requested_key) {
+            return true;
+        }
+
+        if model
+            .model_name
+            .as_deref()
+            .is_some_and(|name| Self::normalize_model_key(name).contains(&requested_key))
+        {
+            return true;
+        }
+
+        let tokens: Vec<String> = Self::model_tokens(requested_model_id)
+            .into_iter()
+            .filter(|token| token != "latest" && token != "model")
+            .collect();
+        if tokens.is_empty() {
+            return false;
+        }
+
+        let candidate_tokens: HashSet<String> = Self::model_tokens(&format!(
+            "{} {}",
+            model.model_id,
+            model.model_name.as_deref().unwrap_or("")
+        ))
+        .into_iter()
+        .collect();
+
+        if !tokens
+            .iter()
+            .all(|token| candidate_tokens.contains(token.as_str()))
+        {
+            return false;
+        }
+
+        for family in ["opus", "sonnet", "haiku"] {
+            let requested_has_family = tokens.iter().any(|token| token == family);
+            let candidate_has_family = candidate_tokens.contains(family);
+            if requested_has_family != candidate_has_family {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// 把解析出的 CodeWhisperer modelId 写回请求体（currentMessage + 整个 history）。
+    fn apply_payload_model_id(request_body: &str, model_id: &str) -> String {
+        let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) else {
+            return request_body.to_string();
+        };
+
+        if let Some(current_model_id) =
+            json.pointer_mut("/conversationState/currentMessage/userInputMessage/modelId")
+        {
+            *current_model_id = serde_json::Value::String(model_id.to_string());
+        }
+
+        if let Some(history) = json
+            .pointer_mut("/conversationState/history")
+            .and_then(|value| value.as_array_mut())
+        {
+            for message in history {
+                if let Some(history_model_id) = message.pointer_mut("/userInputMessage/modelId") {
+                    *history_model_id = serde_json::Value::String(model_id.to_string());
+                }
+            }
+        }
+
+        serde_json::to_string(&json).unwrap_or_else(|_| request_body.to_string())
     }
 
     /// 从请求体中提取 conversationId，用于 balanced 模式下的会话凭据绑定。

@@ -35,6 +35,13 @@ pub trait KiroEndpoint: Send + Sync {
         None
     }
 
+    /// ListAvailableProfiles endpoint URL.
+    ///
+    /// 返回 `None` 表示该端点暂不支持 profile 自动发现。
+    fn profiles_url(&self, _ctx: &RequestContext<'_>) -> Option<String> {
+        None
+    }
+
     /// 装饰 API 请求的端点特有 header
     ///
     /// Provider 已经设置好 URL、content-type、Connection 和 body；
@@ -46,6 +53,11 @@ pub trait KiroEndpoint: Send + Sync {
 
     /// 装饰 ListAvailableModels 请求的端点特有 header。
     fn decorate_models(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
+        self.decorate_api(req, ctx)
+    }
+
+    /// 装饰 ListAvailableProfiles 请求的端点特有 header。
+    fn decorate_profiles(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         self.decorate_api(req, ctx)
     }
 
@@ -82,19 +94,11 @@ pub struct RequestContext<'a> {
     pub config: &'a Config,
 }
 
-/// 默认的"额度用尽"判断逻辑（402 时触发禁用凭据 + 故障转移）
+/// 默认的 MONTHLY_REQUEST_COUNT 判断逻辑
 ///
-/// 识别两类需要立即弃用该凭据的额度耗尽信号：
-/// - `MONTHLY_REQUEST_COUNT`：月度请求额度用尽
-/// - `OVERAGE_REQUEST_LIMIT_EXCEEDED`：已开启 overages 且超额额度也已用尽
-///
-/// 两者语义一致——该账号当前已无可用额度，应禁用并切到下一个可用凭据。
 /// 同时识别顶层 `reason` 字段和嵌套 `error.reason` 字段。
 pub fn default_is_monthly_request_limit(body: &str) -> bool {
-    const EXHAUSTED_REASONS: [&str; 2] =
-        ["MONTHLY_REQUEST_COUNT", "OVERAGE_REQUEST_LIMIT_EXCEEDED"];
-
-    if EXHAUSTED_REASONS.iter().any(|r| body.contains(r)) {
+    if body.contains("MONTHLY_REQUEST_COUNT") {
         return true;
     }
 
@@ -102,15 +106,18 @@ pub fn default_is_monthly_request_limit(body: &str) -> bool {
         return false;
     };
 
-    let reason_matches = |reason: Option<&str>| {
-        reason.is_some_and(|v| EXHAUSTED_REASONS.contains(&v))
-    };
-
-    if reason_matches(value.get("reason").and_then(|v| v.as_str())) {
+    if value
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
+    {
         return true;
     }
 
-    reason_matches(value.pointer("/error/reason").and_then(|v| v.as_str()))
+    value
+        .pointer("/error/reason")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
 }
 
 /// 默认的 bearer token 失效判断逻辑
@@ -138,19 +145,6 @@ mod tests {
     fn test_default_monthly_request_limit_false() {
         let body = r#"{"message":"nope","reason":"DAILY_REQUEST_COUNT"}"#;
         assert!(!default_is_monthly_request_limit(body));
-    }
-
-    #[test]
-    fn test_overage_request_limit_detected_as_exhausted() {
-        // 开启 overages 且超额也用尽 -> 应识别为额度耗尽，触发禁用+切号
-        let body = r#"{"message":"You have reached the limit for overages.","reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#;
-        assert!(default_is_monthly_request_limit(body));
-    }
-
-    #[test]
-    fn test_overage_request_limit_nested_reason() {
-        let body = r#"{"error":{"reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}}"#;
-        assert!(default_is_monthly_request_limit(body));
     }
 
     #[test]

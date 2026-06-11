@@ -1,8 +1,9 @@
 //! Kiro IDE 端点
 //!
-//! 对应 Kiro IDE 客户端目前使用的 AWS CodeWhisperer 端点：
-//! - API: `https://q.{api_region}.amazonaws.com/generateAssistantResponse`
-//! - MCP: `https://q.{api_region}.amazonaws.com/mcp`
+//! 对应 KAM 1.7.5 的反代行为：
+//! - Enterprise / External IdP 流式生成走 `codewhisperer.{region}.amazonaws.com`
+//! - 模型列表走 `q.{region}.amazonaws.com/ListAvailableModels`
+//! - Builder ID 的占位 profileArn 不会出现在流式生成请求里
 //!
 //! 请求头使用 aws-sdk-js User-Agent 标识。请求体会在根对象上注入 `profileArn`。
 
@@ -26,50 +27,43 @@ impl IdeEndpoint {
         ctx.credentials.effective_api_region(ctx.config)
     }
 
-    fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("q.{}.amazonaws.com", self.api_region(ctx))
-    }
-
-    fn cli_os(&self, ctx: &RequestContext<'_>) -> &'static str {
-        let os = ctx
-            .config
-            .system_version
-            .split('#')
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-
-        if os.contains("win") {
-            "windows"
-        } else if os.contains("darwin") || os.contains("mac") {
-            "macos"
+    fn runtime_region(&self, ctx: &RequestContext<'_>) -> &'static str {
+        if self
+            .api_region(ctx)
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("eu-")
+        {
+            "eu-central-1"
         } else {
-            "linux"
+            "us-east-1"
         }
     }
 
-    fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
-        if ctx.credentials.is_idc_auth() {
-            return format!(
-                "aws-sdk-rust/1.3.9 ua/2.1 api/ssooidc/1.88.0 os/{} lang/rust/1.87.0 m/E app/AmazonQ-For-CLI",
-                self.cli_os(ctx)
-            );
-        }
+    fn q_host(&self, ctx: &RequestContext<'_>) -> String {
+        format!("q.{}.amazonaws.com", self.runtime_region(ctx))
+    }
 
+    fn codewhisperer_host(&self, ctx: &RequestContext<'_>) -> String {
+        format!("codewhisperer.{}.amazonaws.com", self.runtime_region(ctx))
+    }
+
+    fn api_host(&self, ctx: &RequestContext<'_>) -> String {
+        if ctx.credentials.is_enterprise_auth() {
+            self.codewhisperer_host(ctx)
+        } else {
+            self.q_host(ctx)
+        }
+    }
+
+    fn ide_x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-js/1.0.34 KiroIDE {} {}",
             ctx.config.kiro_version, ctx.machine_id
         )
     }
 
-    fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
-        if ctx.credentials.is_idc_auth() {
-            return format!(
-                "aws-sdk-rust/1.3.9 os/{} lang/rust/1.87.0",
-                self.cli_os(ctx)
-            );
-        }
-
+    fn ide_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
             ctx.config.system_version,
@@ -77,6 +71,20 @@ impl IdeEndpoint {
             ctx.config.kiro_version,
             ctx.machine_id
         )
+    }
+
+    fn add_token_type_headers(
+        &self,
+        mut req: RequestBuilder,
+        ctx: &RequestContext<'_>,
+    ) -> RequestBuilder {
+        if ctx.credentials.is_api_key_credential() {
+            req = req.header("tokentype", "API_KEY");
+        }
+        if ctx.credentials.is_external_idp_auth() {
+            req = req.header("TokenType", "EXTERNAL_IDP");
+        }
+        req
     }
 }
 
@@ -92,65 +100,63 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
-            self.api_region(ctx)
-        )
+        format!("https://{}/generateAssistantResponse", self.api_host(ctx))
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
+        format!("https://{}/mcp", self.q_host(ctx))
     }
 
     fn models_url(&self, ctx: &RequestContext<'_>) -> Option<String> {
+        Some(format!("https://{}/ListAvailableModels", self.q_host(ctx)))
+    }
+
+    fn profiles_url(&self, ctx: &RequestContext<'_>) -> Option<String> {
         Some(format!(
-            "https://q.{}.amazonaws.com/ListAvailableModels",
-            self.api_region(ctx)
+            "https://{}/ListAvailableProfiles",
+            self.codewhisperer_host(ctx)
         ))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        let agent_mode = if ctx.credentials.is_idc_auth() {
-            "vibe"
-        } else {
-            "spec"
-        };
-
-        let mut req = req
+        let req = req
             .header("x-amzn-codewhisperer-optout", "true")
-            .header("x-amzn-kiro-agent-mode", agent_mode)
-            .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
-            .header("user-agent", self.user_agent(ctx))
-            .header("host", self.host(ctx))
+            .header("x-amzn-kiro-agent-mode", "vibe")
+            .header("x-amz-user-agent", self.ide_x_amz_user_agent(ctx))
+            .header("user-agent", self.ide_user_agent(ctx))
+            .header("host", self.api_host(ctx))
             .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
-        }
-        req
+        self.add_token_type_headers(req, ctx)
     }
 
     fn decorate_models(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        let mut req = req
+        let req = req
             .header("x-amzn-codewhisperer-optout", "true")
-            .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
-            .header("user-agent", self.user_agent(ctx))
-            .header("host", self.host(ctx))
+            .header("x-amz-user-agent", self.ide_x_amz_user_agent(ctx))
+            .header("user-agent", self.ide_user_agent(ctx))
+            .header("host", self.q_host(ctx))
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
-        }
-        req
+        self.add_token_type_headers(req, ctx)
+    }
+
+    fn decorate_profiles(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
+        req.header("x-amz-user-agent", self.ide_x_amz_user_agent(ctx))
+            .header("user-agent", self.ide_user_agent(ctx))
+            .header("host", self.codewhisperer_host(ctx))
+            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("Authorization", format!("Bearer {}", ctx.token))
     }
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let mut req = req
-            .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
-            .header("user-agent", self.user_agent(ctx))
-            .header("host", self.host(ctx))
+            .header("x-amz-user-agent", self.ide_x_amz_user_agent(ctx))
+            .header("user-agent", self.ide_user_agent(ctx))
+            .header("host", self.q_host(ctx))
             .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
@@ -158,22 +164,24 @@ impl KiroEndpoint for IdeEndpoint {
         if let Some(ref arn) = ctx.credentials.profile_arn {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
-        }
-        req
+        self.add_token_type_headers(req, ctx)
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
-        inject_profile_arn(body, &ctx.credentials.resolved_profile_arn())
+        inject_profile_arn(body, &ctx.credentials.resolved_stream_profile_arn())
     }
 }
 
 /// 将 profile_arn 注入到请求体 JSON 根对象
 fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> String {
-    if let Some(arn) = profile_arn {
-        if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
+    if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
+        if let Some(arn) = profile_arn {
             json["profileArn"] = serde_json::Value::String(arn.clone());
+            if let Ok(body) = serde_json::to_string(&json) {
+                return body;
+            }
+        } else if let Some(object) = json.as_object_mut() {
+            object.remove("profileArn");
             if let Ok(body) = serde_json::to_string(&json) {
                 return body;
             }
@@ -207,6 +215,15 @@ mod tests {
         let json: Value = serde_json::from_str(&result).unwrap();
         assert!(json.get("profileArn").is_none());
         assert_eq!(json["conversationState"]["conversationId"], "c1");
+    }
+
+    #[test]
+    fn test_inject_profile_arn_with_none_removes_existing() {
+        let body = r#"{"conversationState":{},"profileArn":"placeholder"}"#;
+        let result = inject_profile_arn(body, &None);
+        let json: Value = serde_json::from_str(&result).unwrap();
+        assert!(json.get("profileArn").is_none());
+        assert!(json.get("conversationState").is_some());
     }
 
     #[test]

@@ -25,6 +25,8 @@ interface CredentialInput {
   region?: string
   authRegion?: string
   apiRegion?: string
+  profileArn?: string
+  startUrl?: string
   priority?: number
   machineId?: string
   kiroApiKey?: string
@@ -48,7 +50,45 @@ interface VerificationResult {
   rollbackError?: string
 }
 
+function normalizeUsageApiRegion(region?: string): string | undefined {
+  const trimmed = region?.trim()
+  if (!trimmed) return undefined
+  return trimmed.toLowerCase().startsWith('eu-') ? 'eu-central-1' : 'us-east-1'
+}
 
+function getStringField(obj: Record<string, unknown>, ...names: string[]): string | undefined {
+  for (const name of names) {
+    const value = obj[name]
+    if (typeof value === 'string') return value
+  }
+  return undefined
+}
+
+function getNumberField(obj: Record<string, unknown>, name: string): number | undefined {
+  const value = obj[name]
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function normalizeCredentialInput(item: unknown): CredentialInput {
+  if (typeof item !== 'object' || item === null) return {}
+  const obj = item as Record<string, unknown>
+  return {
+    refreshToken: getStringField(obj, 'refreshToken', 'refresh_token'),
+    clientId: getStringField(obj, 'clientId', 'client_id'),
+    clientSecret: getStringField(obj, 'clientSecret', 'client_secret'),
+    region: getStringField(obj, 'region'),
+    authRegion: getStringField(obj, 'authRegion', 'auth_region'),
+    apiRegion: getStringField(obj, 'apiRegion', 'api_region'),
+    profileArn: getStringField(obj, 'profileArn', 'profile_arn'),
+    startUrl: getStringField(obj, 'startUrl', 'start_url'),
+    priority: getNumberField(obj, 'priority'),
+    machineId: getStringField(obj, 'machineId', 'machine_id'),
+    kiroApiKey: getStringField(obj, 'kiroApiKey', 'kiro_api_key'),
+    authMethod: getStringField(obj, 'authMethod', 'auth_method'),
+    provider: getStringField(obj, 'provider'),
+    endpoint: getStringField(obj, 'endpoint'),
+  }
+}
 
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
@@ -95,7 +135,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     let credentials: CredentialInput[]
     try {
       const parsed = JSON.parse(jsonInput)
-      credentials = Array.isArray(parsed) ? parsed : [parsed]
+      const rawCredentials = Array.isArray(parsed) ? parsed : [parsed]
+      credentials = rawCredentials.map(normalizeCredentialInput)
     } catch (error) {
       toast.error('JSON 格式错误: ' + extractErrorMessage(error))
       return
@@ -139,7 +180,11 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       // 4. 导入并验活
       for (let i = 0; i < credentials.length; i++) {
         const cred = credentials[i]
-        const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
+        const normalizedAuthMethod = cred.authMethod?.trim().toLowerCase()
+        const isApiKeyCred =
+          !!(cred.kiroApiKey?.trim()) ||
+          normalizedAuthMethod === 'api_key' ||
+          normalizedAuthMethod === 'apikey'
 
         // 更新状态为检查中
         setCurrentProcessing(`正在处理凭据 ${i + 1}/${credentials.length}`)
@@ -287,8 +332,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             refreshToken: token,
             authMethod,
             provider: cred.provider?.trim() || undefined,
+            startUrl: cred.startUrl?.trim() || undefined,
             authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
-            apiRegion: cred.apiRegion?.trim() || undefined,
+            apiRegion: cred.apiRegion?.trim() || normalizeUsageApiRegion(cred.region),
+            profileArn: cred.profileArn?.trim() || undefined,
             clientId,
             clientSecret,
             priority: cred.priority || 0,
@@ -437,14 +484,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"...","profileArn":"...","startUrl":"..."}]\n也兼容 snake_case: [{"refresh_token":"...","client_id":"...","client_secret":"...","profile_arn":"...","start_url":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              💡 导入时自动验活，失败的凭据会被排除
+              导入时自动验活，失败的凭据会被排除。
             </p>
           </div>
 

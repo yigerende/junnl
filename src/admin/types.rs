@@ -116,19 +116,30 @@ pub struct BatchSetConcurrencyRequest {
 #[serde(rename_all = "camelCase")]
 pub struct AddCredentialRequest {
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
+    #[serde(alias = "refresh_token")]
     pub refresh_token: Option<String>,
 
     /// 认证方式（可选，默认 social）
-    #[serde(default = "default_auth_method")]
+    #[serde(default = "default_auth_method", alias = "auth_method")]
     pub auth_method: String,
 
     /// 登录 Provider（可选；KAM 新格式会携带 Google/Github/BuilderId 等）
     pub provider: Option<String>,
 
+    /// SSO Start URL（可选；Enterprise/IAM Identity Center 账号）
+    #[serde(alias = "start_url")]
+    pub start_url: Option<String>,
+
+    /// Profile ARN（可选；KAM/官方缓存可能携带）
+    #[serde(alias = "profile_arn")]
+    pub profile_arn: Option<String>,
+
     /// OIDC Client ID（IdC 认证需要）
+    #[serde(alias = "client_id")]
     pub client_id: Option<String>,
 
     /// OIDC Client Secret（IdC 认证需要）
+    #[serde(alias = "client_secret")]
     pub client_secret: Option<String>,
 
     /// 优先级（可选，默认 0）
@@ -140,25 +151,31 @@ pub struct AddCredentialRequest {
     pub region: Option<String>,
 
     /// 凭据级 Auth Region（用于 Token 刷新）
+    #[serde(alias = "auth_region")]
     pub auth_region: Option<String>,
 
     /// 凭据级 API Region（用于 API 请求）
+    #[serde(alias = "api_region")]
     pub api_region: Option<String>,
 
     /// 凭据级 Machine ID（可选，64 位字符串）
     /// 未配置时回退到 config.json 的 machineId
+    #[serde(alias = "machine_id")]
     pub machine_id: Option<String>,
 
     /// 用户邮箱（可选，用于前端显示）
     pub email: Option<String>,
 
     /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
+    #[serde(alias = "proxy_url")]
     pub proxy_url: Option<String>,
 
     /// 凭据级代理认证用户名（可选）
+    #[serde(alias = "proxy_username")]
     pub proxy_username: Option<String>,
 
     /// 凭据级代理认证密码（可选）
+    #[serde(alias = "proxy_password")]
     pub proxy_password: Option<String>,
 
     /// 代理池代理 ID 列表，按优先级从高到低排列
@@ -167,6 +184,7 @@ pub struct AddCredentialRequest {
 
     /// Kiro API Key（API Key 凭据必填，格式: ksk_xxxxxxxx）
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
+    #[serde(alias = "kiro_api_key")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kiro_api_key: Option<String>,
 

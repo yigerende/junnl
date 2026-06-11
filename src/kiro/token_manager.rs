@@ -6,6 +6,7 @@
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
@@ -352,12 +353,107 @@ async fn refresh_idc_token(
         new_credentials.expires_at = Some(expires_at.to_rfc3339());
     }
 
-    // 同步更新 profile_arn（如果 IdC 响应中包含）
-    if let Some(profile_arn) = data.profile_arn {
-        new_credentials.profile_arn = Some(profile_arn);
-    }
+    // 注意：不再从 IdC 刷新响应同步 profile_arn——上游响应里的 profileArn 不可信，
+    // 改由 ListAvailableProfiles 运行时自愈（对齐上游 903ff21）。
 
     Ok(new_credentials)
+}
+
+/// 将任意 region 折叠为 usage API 实际支持的两个 region 之一（对齐 KAM）。
+fn normalize_usage_api_region(region: &str) -> &'static str {
+    let region = region.trim();
+    if region.to_ascii_lowercase().starts_with("eu-") {
+        "eu-central-1"
+    } else {
+        "us-east-1"
+    }
+}
+
+fn push_unique_region(regions: &mut Vec<String>, region: &str) {
+    if !regions.iter().any(|existing| existing == region) {
+        regions.push(region.to_string());
+    }
+}
+
+/// 生成 usage 查询的 region 候选：primary + 另一个 region 作兜底。
+fn usage_api_region_candidates(credentials: &KiroCredentials, config: &Config) -> Vec<String> {
+    let primary_source = credentials
+        .api_region
+        .as_deref()
+        .or(credentials.auth_region.as_deref())
+        .or(credentials.region.as_deref())
+        .or(config.api_region.as_deref())
+        .unwrap_or(config.effective_api_region());
+
+    let primary = normalize_usage_api_region(primary_source);
+    let fallback = if primary == "eu-central-1" {
+        "us-east-1"
+    } else {
+        "eu-central-1"
+    };
+
+    let mut regions = Vec::new();
+    push_unique_region(&mut regions, primary);
+    push_unique_region(&mut regions, fallback);
+    regions
+}
+
+/// usage 查询的 profileArn 候选：IdC 一律不带；social 带显式 ARN 再加不带的兜底。
+fn usage_profile_arn_candidates(credentials: &KiroCredentials) -> Vec<Option<String>> {
+    if credentials.is_idc_auth() {
+        return vec![None];
+    }
+
+    match credentials.profile_arn.as_deref().map(str::trim) {
+        Some(profile_arn) if !profile_arn.is_empty() => vec![Some(profile_arn.to_string()), None],
+        _ => vec![None],
+    }
+}
+
+fn usage_limits_url(host: &str, profile_arn: Option<&str>) -> String {
+    let mut url = format!(
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
+        host
+    );
+
+    if let Some(profile_arn) = profile_arn {
+        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
+    }
+
+    url
+}
+
+fn usage_limits_user_agents(machine_id: &str) -> (String, String) {
+    // KAM 对 GetUsageLimits 使用旧版 CodeWhisperer Streaming UA。Enterprise token
+    // 用新版 runtime UA 会被拒为 "Invalid profileArn"。
+    let user_agent = format!(
+        "aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-0.6.18-{}",
+        machine_id
+    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.18 KiroIDE 0.6.18 {}", machine_id);
+    (user_agent, amz_user_agent)
+}
+
+struct UsageLimitsHttpError {
+    status: StatusCode,
+    body: String,
+}
+
+impl UsageLimitsHttpError {
+    fn is_invalid_profile_arn(&self) -> bool {
+        self.status == StatusCode::BAD_REQUEST && self.body.contains("Invalid profileArn")
+    }
+
+    fn message(&self) -> String {
+        let error_msg = match self.status.as_u16() {
+            401 => "认证失败，Token 无效或已过期",
+            403 => "权限不足，无法获取使用额度",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "服务器错误，AWS 服务暂时不可用",
+            _ => "获取使用额度失败",
+        };
+        format!("{}: {} {}", error_msg, self.status, self.body)
+    }
 }
 
 /// 获取使用额度信息
@@ -369,68 +465,75 @@ pub(crate) async fn get_usage_limits(
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!("正在获取使用额度信息...");
 
-    // 优先级：凭据.api_region > config.api_region > config.region
-    let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
-
-    // 构建 URL
-    let mut url = format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
-        host
-    );
-
-    // 最新 Kiro 客户端在缺失 profileArn 时也会按认证方式补默认 ARN。
-    if let Some(profile_arn) = credentials.resolved_profile_arn() {
-        url.push_str(&format!(
-            "&profileArn={}",
-            urlencoding::encode(&profile_arn)
-        ));
-    }
-
-    // 构建 User-Agent headers
-    let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
-    );
-    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+    let (user_agent, amz_user_agent) = usage_limits_user_agents(&machine_id);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
+    let regions = usage_api_region_candidates(credentials, config);
+    let profile_arns = usage_profile_arn_candidates(credentials);
+    let mut last_retryable_error: Option<UsageLimitsHttpError> = None;
 
-    let mut request = client
-        .get(&url)
-        .header("x-amz-user-agent", &amz_user_agent)
-        .header("user-agent", &user_agent)
-        .header("host", &host)
-        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=1")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Connection", "close");
+    for region in regions {
+        let host = format!("q.{}.amazonaws.com", region);
 
-    if credentials.is_api_key_credential() {
-        request = request.header("tokentype", "API_KEY");
+        for profile_arn in &profile_arns {
+            let url = usage_limits_url(&host, profile_arn.as_deref());
+            let mut request = client
+                .get(&url)
+                .header("Accept", "application/json")
+                .header("x-amz-user-agent", &amz_user_agent)
+                .header("user-agent", &user_agent)
+                .header("host", &host)
+                .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+                .header("amz-sdk-request", "attempt=1; max=1")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Connection", "close");
+
+            if credentials.is_api_key_credential() {
+                request = request.header("tokentype", "API_KEY");
+            }
+
+            let response = request.send().await?;
+            let status = response.status();
+            if status.is_success() {
+                let data: UsageLimitsResponse = response.json().await?;
+                return Ok(data);
+            }
+
+            let body_text = response.text().await.unwrap_or_default();
+            let error = UsageLimitsHttpError {
+                status,
+                body: body_text,
+            };
+
+            if status.as_u16() == 403 {
+                tracing::debug!(
+                    "getUsageLimits 返回 403，按 KAM 兼容策略重试: region={}, with_profile_arn={}",
+                    region,
+                    profile_arn.is_some()
+                );
+                last_retryable_error = Some(error);
+                continue;
+            }
+
+            if profile_arn.is_some() && error.is_invalid_profile_arn() {
+                tracing::debug!(
+                    "getUsageLimits 返回 Invalid profileArn，改为不带 profileArn 重试: region={}",
+                    region
+                );
+                last_retryable_error = Some(error);
+                continue;
+            }
+
+            bail!("{}", error.message());
+        }
     }
 
-    let response = request.send().await?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_default();
-        let error_msg = match status.as_u16() {
-            401 => "认证失败，Token 无效或已过期",
-            403 => "权限不足，无法获取使用额度",
-            429 => "请求过于频繁，已被限流",
-            500..=599 => "服务器错误，AWS 服务暂时不可用",
-            _ => "获取使用额度失败",
-        };
-        bail!("{}: {} {}", error_msg, status, body_text);
+    if let Some(error) = last_retryable_error {
+        bail!("{}", error.message());
     }
 
-    let data: UsageLimitsResponse = response.json().await?;
-    Ok(data)
+    bail!("获取使用额度失败: 没有可用的 Kiro REST API 端点")
 }
 
 /// 设置用户偏好（超额开关）。
@@ -939,6 +1042,33 @@ impl MultiTokenManager {
     /// 获取配置的引用
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// 将自愈拿到的真实 profileArn 回写到指定凭据并持久化。
+    ///
+    /// 仅由 provider 的 profileArn 自愈路径调用：只改 `profile_arn` 一个字段，
+    /// 不触碰调度状态（failure/success/active/优先级等）。值未变化时不写盘。
+    pub fn update_profile_arn(&self, id: u64, profile_arn: String) -> anyhow::Result<bool> {
+        let changed = {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            if entry.credentials.profile_arn.as_deref() == Some(profile_arn.as_str()) {
+                false
+            } else {
+                entry.credentials.profile_arn = Some(profile_arn);
+                true
+            }
+        };
+
+        if changed {
+            self.persist_credentials()?;
+        }
+
+        Ok(changed)
     }
 
     /// 绑定自身的 Arc 弱引用。
@@ -3054,6 +3184,98 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_usage_api_region_candidates_use_kam_enterprise_mapping_for_eu_auth_region() {
+        let config = Config::default();
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_region = Some("eu-west-1".to_string());
+
+        assert_eq!(
+            usage_api_region_candidates(&credentials, &config),
+            vec!["eu-central-1".to_string(), "us-east-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_usage_api_region_candidates_use_kam_mapping_for_non_eu_region() {
+        let config = Config::default();
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_region = Some("ap-northeast-1".to_string());
+
+        assert_eq!(
+            usage_api_region_candidates(&credentials, &config),
+            vec!["us-east-1".to_string(), "eu-central-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_usage_api_region_candidates_api_region_takes_priority() {
+        let config = Config::default();
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_region = Some("eu-west-1".to_string());
+        credentials.api_region = Some("us-east-1".to_string());
+
+        assert_eq!(
+            usage_api_region_candidates(&credentials, &config),
+            vec!["us-east-1".to_string(), "eu-central-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_usage_profile_arn_candidates_do_not_inject_default_profile_arn() {
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+
+        let candidates = usage_profile_arn_candidates(&credentials);
+        assert_eq!(candidates, vec![None]);
+    }
+
+    #[test]
+    fn test_usage_profile_arn_candidates_ignore_idc_profile_arn_like_kam() {
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            profile_arn: Some("arn:explicit".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+
+        let candidates = usage_profile_arn_candidates(&credentials);
+        assert_eq!(candidates, vec![None]);
+    }
+
+    #[test]
+    fn test_usage_profile_arn_candidates_retry_without_explicit_social_profile_arn() {
+        let credentials = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            provider: Some("Github".to_string()),
+            profile_arn: Some("arn:explicit".to_string()),
+            ..Default::default()
+        };
+
+        let candidates = usage_profile_arn_candidates(&credentials);
+        assert_eq!(candidates, vec![Some("arn:explicit".to_string()), None]);
+    }
+
+    #[test]
+    fn test_usage_limits_user_agents_match_kam_rest_request() {
+        let machine_id = "a".repeat(64);
+        let (user_agent, amz_user_agent) = usage_limits_user_agents(&machine_id);
+
+        assert!(user_agent.contains("aws-sdk-js/1.0.18"));
+        assert!(user_agent.contains("api/codewhispererstreaming#1.0.18"));
+        assert!(user_agent.contains("KiroIDE-0.6.18-"));
+        assert!(user_agent.ends_with(&machine_id));
+        assert_eq!(
+            amz_user_agent,
+            format!("aws-sdk-js/1.0.18 KiroIDE 0.6.18 {}", machine_id)
+        );
+    }
 
     #[test]
     fn test_is_token_expired_with_expired_token() {
